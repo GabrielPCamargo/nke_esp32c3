@@ -1,0 +1,73 @@
+#ifndef ESP32C3_REGS_H
+#define ESP32C3_REGS_H
+
+// =============================================================================
+// SYSTIMER REGISTERS — offsets from TRM v1.4 Chapter 10 register summary
+// =============================================================================
+#define SYSTIMER_BASE           0x60023000UL
+
+// Clock + enable control (all enables live here, not in TARGET_CONF)
+#define SYSTIMER_CONF           (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0000))
+//   bit 31 = CLK_EN
+//   bit 29 = TIMER_UNIT0_WORK_EN
+//   bit 23 = TARGET0_WORK_EN  (COMP0 enable — must be set here, not in TARGET0_CONF)
+
+// UNIT0 snapshot
+#define SYSTIMER_UNIT0_OP       (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0004))
+//   bit 30 = TIMER_UNIT0_UPDATE  (trigger snapshot, WT)
+//   bit 29 = TIMER_UNIT0_VALUE_VALID (poll until 1)
+
+// UNIT0 load (write new counter value)
+#define SYSTIMER_UNIT0_LOAD_HI  (*(volatile uint32_t *)(SYSTIMER_BASE + 0x000C))
+#define SYSTIMER_UNIT0_LOAD_LO  (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0010))
+#define SYSTIMER_UNIT0_LOAD     (*(volatile uint32_t *)(SYSTIMER_BASE + 0x005C)) // strobe WT
+
+// UNIT0 snapshot read (read-only, populated after UPDATE)
+#define SYSTIMER_UNIT0_VALUE_HI (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0040)) // RO
+#define SYSTIMER_UNIT0_VALUE_LO (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0044)) // RO
+
+// COMP0 (TARGET0) — alarm config
+#define SYSTIMER_TARGET0_HI     (*(volatile uint32_t *)(SYSTIMER_BASE + 0x001C))
+#define SYSTIMER_TARGET0_LO     (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0020))
+#define SYSTIMER_TARGET0_CONF   (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0034))
+//   bit 31 = TIMER_UNIT_SEL  (0 = UNIT0, 1 = UNIT1)
+//   bit 30 = PERIOD_MODE     (0 = target/one-shot, 1 = period)
+//   bits 25:0 = PERIOD value
+#define SYSTIMER_COMP0_LOAD     (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0050)) // strobe WT
+
+// Interrupt registers
+#define SYSTIMER_INT_ENA        (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0064))
+#define SYSTIMER_INT_RAW        (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0068))
+#define SYSTIMER_INT_CLR        (*(volatile uint32_t *)(SYSTIMER_BASE + 0x006C))
+#define SYSTIMER_INT_ST         (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0070))
+
+
+// =============================================================================
+// INTERRUPT MATRIX REGISTERS — offsets from TRM v1.4 Chapter 8
+// =============================================================================
+#define INTMTX_BASE             0x600C2000UL
+
+#define INTMTX_GPIO_MAP         (*(volatile uint32_t *)(INTMTX_BASE + 0x0040))
+#define INTMTX_SYSTIMER_T0_MAP  (*(volatile uint32_t *)(INTMTX_BASE + 0x0094))
+#define INTCTL_ENABLE           (*(volatile uint32_t *)(INTMTX_BASE + 0x0104))
+#define INTCTL_TYPE             (*(volatile uint32_t *)(INTMTX_BASE + 0x0108))
+#define INTCTL_CLEAR            (*(volatile uint32_t *)(INTMTX_BASE + 0x010C))
+#define INTCTL_PRI(n)           (*(volatile uint32_t *)(INTMTX_BASE + 0x0114 + (n)*4))
+#define INTCTL_THRESH           (*(volatile uint32_t *)(INTMTX_BASE + 0x0194))
+
+// =============================================================================
+// GPIO REGISTERS
+// =============================================================================
+#define GPIO_STATUS             (*(volatile uint32_t *)(C3_GPIO + 0x044))
+#define GPIO_STATUS_W1TC        (*(volatile uint32_t *)(C3_GPIO + 0x04C))
+#define GPIO_PIN(n)             (*(volatile uint32_t *)(C3_GPIO + 0x074 + (n)*4))
+
+// =============================================================================
+// PIN / INTERRUPT ASSIGNMENTS
+// =============================================================================
+#define CPU_INTR_GPIO    5
+#define CPU_INTR_TIMER   6
+#define BTN_PIN          4
+#define LED_PIN          8
+
+#endif // ESP32C3_REGS_H

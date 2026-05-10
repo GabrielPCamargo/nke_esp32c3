@@ -1,0 +1,1271 @@
+/*
+ * 
+ * Versao com implementação de fila de print - 
+ *    06/06/2025 
+ *
+*/
+
+#include <mdk.h>
+#include <esp32c3_regs.h>
+
+/*
+*
+* Vari veis do Kernel
+*
+*/
+/*Define intervalo das interrup  es de Clock 
+ * Tabela de Interrup  es :
+ * 1       ClkT = 1   segundo
+ * 0.1     ClkT = 100 milissegundos
+ * 0.01    Clkt = 10  milissegundos
+ * 0.001   Clkt = 1   milissegundo
+ * 0.0001  ClkT = 100 microssegundos
+ * 0.00001 ClkT = 10  microssegundos
+*/
+#define ClkT 2 //equivale a 2 segundos
+
+// SYSTIMER clock = 16 MHz → 1000 ms = 16_000_000 ticks
+// PERIOD field is 26 bits max (67 million), so 16_000_000 fits fine (1s)
+#define Slice 16000000UL //1 segundo
+#define MaxNumberTask 4
+#define NUM_TASKS 4
+#define SizeTaskStack 2048// Tamanho da pilha da tarefa
+#define MAX_NKREAD_QUEUE 5 // N mero m ximo de threads esperando por leitura
+#define MAX_NKPRINT_QUEUE 50 // Número máximo de mensagens esperando por impressão
+#define MAX_NAME_LENGTH 30
+unsigned int NumberTaskAdd=-1;
+volatile int TaskRunning = 0;
+volatile bool os_started = false;
+char myName[MAX_NAME_LENGTH];
+int  SchedulerAlgorithm ;
+
+
+enum Scheduler{
+  RR,
+  RM,
+  EDF
+};
+enum Taskstates{
+  INITIAL,
+  READY,
+  RUNNING,
+  DEAD,
+  BLOCKED
+};
+typedef struct 
+{
+    int queue[MaxNumberTask];
+    int tail;
+    int head;
+}ReadyList;
+ReadyList ready_queue;
+
+typedef struct 
+{
+  short count;
+  int sem_queue[MaxNumberTask], tail, header;
+}sem_t;
+
+typedef struct {
+    int tid; // ID da thread esperando pela leitura
+    const char *format; // Formato da entrada esperado (similar ao scanf)
+    void *var; // Argumentos onde os dados ser o armazenados
+} NkReadQueueEntry;
+
+typedef struct {
+    const char *format; // Formato da entrada esperado (similar ao printf)
+    char type; // 'd', 'f', 'c', 's', '%'
+    union {
+        int i;
+        float f;
+        char c;
+        const char *s;
+    } var; // Variável que será impressa
+} NkPrintQueueEntry;
+
+NkReadQueueEntry nkreadQueue[MAX_NKREAD_QUEUE];
+int nkreadQueueHead = 0;
+int nkreadQueueTail = 0;
+
+NkPrintQueueEntry nkprintQueue[MAX_NKPRINT_QUEUE];
+int nkprintQueueHead = 0;
+int nkprintQueueTail = 0;
+volatile bool printTailMutex;
+volatile bool printHeadMutex;
+
+char serialInputBuffer[128]; // Buffer para armazenar a entrada da serial
+int serialInputIndex = 0;
+
+typedef struct
+{
+  int CallNumber;
+  unsigned char *p0;
+  unsigned char *p1;
+  unsigned char *p2;
+  unsigned char *p3;
+}Parameters;
+volatile Parameters kernelargs ;
+
+
+typedef struct {
+  int16_t Tid;
+  const char *name;
+  unsigned short Prio;
+  uint8_t Period;
+  uint8_t Wcet;
+  uint8_t DynamicPeriod;
+  uint8_t DynamicWcet;
+  unsigned int Time;
+  unsigned short Join;
+  unsigned short State;
+  uint8_t Stack[SizeTaskStack]; // Vetor de pilha
+  uint8_t* P; // Ponteiro de pilha
+} TaskDescriptor;
+TaskDescriptor Descriptors[MaxNumberTask]; // Array de descritores de tarefas
+
+
+// Aparentemente estava quebrando sem os paddings (mas revisar)
+typedef struct {
+    uint32_t ra, t0, t1, t2;
+    uint32_t s0, s1;
+    uint32_t a0, a1, a2, a3, a4, a5, a6, a7;
+    uint32_t s2, s3, s4, s5, s6, s7, s8, s9, s10, s11;
+    uint32_t t3, t4, t5, t6;
+    uint32_t mstatus, mepc;
+    uint32_t padding1, padding2; // <-- CRUCIAL PARA DAR 128 BYTES (Múltiplo de 16)
+} Context;
+/*
+*Servicos do kernel
+*
+*/
+enum sys_temCall{
+  TASKCREATE,
+  SEM_WAIT,
+  SEM_POST,
+  SEM_INIT,
+  WRITELCDN,
+  WRITELCDS,
+  EXITTASK,
+  SLEEP,
+  MSLEEP,
+  USLEEP,
+  RMSSLEEP,
+  LIGALED,
+  DESLIGALED,
+  START, 
+  TASKJOIN,
+  SETMYNAME,
+  GETMYNAME,
+  NKPRINT,
+  GETMYNUMBER,
+  NKREAD,
+};
+
+/*************************************************************
+*                                                            *
+* Rotinas do kernel                                          *
+*                                                            *
+*                                                            *
+*************************************************************/
+
+__attribute__((naked)) void trap_return_ecall(void)
+{
+    __asm__ volatile (
+        "csrr t0, mepc \n\t"
+        "addi t0, t0, 4 \n\t"
+        "csrw mepc, t0 \n\t"
+        "mret\n\t"
+    );
+}
+
+
+void kernel(Parameters *args) {
+    kernelargs = *args;
+
+    switch(kernelargs.CallNumber){
+    case TASKCREATE: 
+      sys_taskcreate((int *)kernelargs.p0,(void(*)())kernelargs.p1,(uint8_t)kernelargs.p2, (uint8_t)kernelargs.p3);
+      break;
+    case SEM_WAIT: 
+     // Serial.println("SEMWAIT: ") ;
+      sys_semwait((sem_t *)kernelargs.p0);
+      break;
+    case SEM_POST: 
+      sys_sempost((sem_t *)kernelargs.p0);
+      break;
+    case SEM_INIT: 
+      //Serial.println("SEMINIT: ") ;
+      sys_seminit((sem_t *)kernelargs.p0,(int)kernelargs.p1);
+      break;
+    case WRITELCDN: // NAO TEREMOS
+      // LCDcomando((int)arg->p1);
+      // LCDnum((int)arg->p0);
+      break;
+    case WRITELCDS: // NAO TEREMOS
+      // LCDcomando((int)arg->p1);
+      // LCDputs((char*)arg->p0);
+      break;
+    case EXITTASK: 
+      sys_taskexit();
+      break;
+    case SLEEP: 
+      sys_sleep((int)kernelargs.p0);
+      break;
+    case MSLEEP: 
+      sys_msleep((int)kernelargs.p0);
+      break;
+    case USLEEP: 
+      sys_usleep((int)kernelargs.p0);
+      break;
+    case RMSSLEEP: 
+      sys_rmssleep();
+      break;
+    case LIGALED: 
+      sys_ligaled();
+      break;
+    case DESLIGALED: 
+      sys_desligaled();
+      break;
+    case START: 
+      sys_start((int)kernelargs.p0);
+      break;
+    case TASKJOIN: // NAO TEREMOS
+     // sys_taskjoin((int)arg->p0);
+      break;
+    case SETMYNAME: 
+      sys_setmyname((const char *)kernelargs.p0);
+      break;
+    case GETMYNAME: 
+      sys_getmyname((const char *)kernelargs.p0);
+      break;  
+    case NKPRINT: 
+       sys_nkprint((char *)kernelargs.p0,(void *)kernelargs.p1);
+       break;
+    case GETMYNUMBER: 
+       sys_getmynumber((int *)kernelargs.p0);
+       break;
+    case NKREAD: 
+       sys_nkread((char *)kernelargs.p0,(void *)kernelargs.p1);
+       break;
+    default:
+       break;
+  }
+
+  //trap_return_ecall();
+}
+/*
+* Passa a executar a rotina do kernel com interrupcoes desabiitadas
+*
+*/
+// void callsvc(Parameters *args)
+// {
+//   noInterrupts();
+//   kernelargs = *args ;
+//   kernel() ;
+//   interrupts();
+// }
+
+// Chamada de sistema já desabilita interrupções, o parâmetro pointeiro args é colocado em a0 (registrador padrão pela ABI)
+
+// void callsvc(Parameters *args)
+// {
+//     register Parameters *a0 asm("a0") = args;
+
+//     asm volatile("csrci mstatus, 0x8");
+//     kernel(a0);
+//     asm volatile("csrsi mstatus, 0x8");
+// }
+
+void callsvc(Parameters *args)
+{
+    // 1. Forçamos o compilador a colocar o ponteiro 'args' no registrador a0.
+    // O registrador a0 é o padrão (ABI) para passar o primeiro argumento.
+    register Parameters *a0 asm("a0") = args;
+
+    // 2. Disparamos a exceção de hardware "Environment Call" (ecall).
+    // O hardware automaticamente pula para o 'ecall_vector' e salva o mepc atual!
+    __asm__ volatile("ecall" : : "r"(a0) : "memory");
+}
+
+/*
+*
+*
+*/
+// --- MACROS DE CONTEXTO ---
+#define SAVE_CONTEXT \
+    "addi sp, sp, -128 \n\t" \
+    "sw ra, 0(sp) \n\t" \
+    "sw t0, 4(sp) \n\t" \
+    "sw t1, 8(sp) \n\t" \
+    "sw t2, 12(sp) \n\t" \
+    "sw s0, 16(sp) \n\t" \
+    "sw s1, 20(sp) \n\t" \
+    "sw a0, 24(sp) \n\t" \
+    "sw a1, 28(sp) \n\t" \
+    "sw a2, 32(sp) \n\t" \
+    "sw a3, 36(sp) \n\t" \
+    "sw a4, 40(sp) \n\t" \
+    "sw a5, 44(sp) \n\t" \
+    "sw a6, 48(sp) \n\t" \
+    "sw a7, 52(sp) \n\t" \
+    "sw s2, 56(sp) \n\t" \
+    "sw s3, 60(sp) \n\t" \
+    "sw s4, 64(sp) \n\t" \
+    "sw s5, 68(sp) \n\t" \
+    "sw s6, 72(sp) \n\t" \
+    "sw s7, 76(sp) \n\t" \
+    "sw s8, 80(sp) \n\t" \
+    "sw s9, 84(sp) \n\t" \
+    "sw s10, 88(sp) \n\t" \
+    "sw s11, 92(sp) \n\t" \
+    "sw t3, 96(sp) \n\t" \
+    "sw t4, 100(sp) \n\t" \
+    "sw t5, 104(sp) \n\t" \
+    "sw t6, 108(sp) \n\t" \
+    "csrr t0, mstatus \n\t" \
+    "sw t0, 112(sp) \n\t" \
+    "csrr t0, mepc \n\t" \
+    "sw t0, 116(sp) \n\t"
+
+#define RESTORE_CONTEXT \
+    "lw t0, 116(sp) \n\t" \
+    "csrw mepc, t0 \n\t" \
+    "lw t0, 112(sp) \n\t" \
+    "csrw mstatus, t0 \n\t" \
+    "lw ra, 0(sp) \n\t" \
+    "lw t0, 4(sp) \n\t" \
+    "lw t1, 8(sp) \n\t" \
+    "lw t2, 12(sp) \n\t" \
+    "lw s0, 16(sp) \n\t" \
+    "lw s1, 20(sp) \n\t" \
+    "lw a0, 24(sp) \n\t" \
+    "lw a1, 28(sp) \n\t" \
+    "lw a2, 32(sp) \n\t" \
+    "lw a3, 36(sp) \n\t" \
+    "lw a4, 40(sp) \n\t" \
+    "lw a5, 44(sp) \n\t" \
+    "lw a6, 48(sp) \n\t" \
+    "lw a7, 52(sp) \n\t" \
+    "lw s2, 56(sp) \n\t" \
+    "lw s3, 60(sp) \n\t" \
+    "lw s4, 64(sp) \n\t" \
+    "lw s5, 68(sp) \n\t" \
+    "lw s6, 72(sp) \n\t" \
+    "lw s7, 76(sp) \n\t" \
+    "lw s8, 80(sp) \n\t" \
+    "lw s9, 84(sp) \n\t" \
+    "lw s10, 88(sp) \n\t" \
+    "lw s11, 92(sp) \n\t" \
+    "lw t3, 96(sp) \n\t" \
+    "lw t4, 100(sp) \n\t" \
+    "lw t5, 104(sp) \n\t" \
+    "lw t6, 108(sp) \n\t" \
+    "addi sp, sp, 128 \n\t" \
+    "mret \n\t"
+
+// --- HANDLERS C SEGUROS ---
+// Estas funções recebem o SP da tarefa interrompida e retornam o SP da nova tarefa a rodar
+uint32_t handle_timer(uint32_t current_sp) {
+    if (!os_started) return current_sp; // Proteção extra para o timer
+    Descriptors[TaskRunning].P = (uint8_t *)current_sp;
+    
+    SYSTIMER_INT_CLR = (1U << 0);
+    (void)SYSTIMER_INT_ST;
+    
+    wakeUP();
+    switchTaskUnsafe(); 
+    processPrintQueue();
+    
+    return (uint32_t)Descriptors[TaskRunning].P;
+}
+
+//Funcionou, mas não sei exatamente por qe precisa desse mcause_val (pois não teve fatal error)
+uint32_t handle_ecall(uint32_t current_sp) {
+    uint32_t mcause_val;
+    // Lê o registrador que nos diz O QUE causou a interrupção
+    __asm__ volatile("csrr %0, mcause" : "=r"(mcause_val));
+
+    // mcause 8 = Syscall de Usuário | mcause 11 = Syscall de Máquina
+    if (mcause_val == 8 || mcause_val == 11) {
+        Context *ctx = (Context *)current_sp;
+        ctx->mepc += 4; // Apenas se for ecall, nós pulamos a instrução
+
+        Parameters *args = (Parameters *)ctx->a0;
+
+        if (!os_started) {
+            kernel(args);
+            return current_sp;
+        }
+
+        Descriptors[TaskRunning].P = (uint8_t *)current_sp;
+        kernel(args); 
+        return (uint32_t)Descriptors[TaskRunning].P;
+    } 
+    else {
+        // --- TELA AZUL DA MORTE DO SEU KERNEL ---
+        // Caiu aqui? É um erro de memória ou ponteiro inválido!
+        Context *ctx = (Context *)current_sp;
+        printf("\n\n=== HARD FAULT DETECTADO ===%d\n", TaskRunning);
+        printf("Codigo mcause : %u\n", mcause_val);
+        printf("mepc (Erro em): 0x%08x\n", ctx->mepc);
+        printf("TaskRunning   : %d\n", TaskRunning);
+        printf("============================%d\n", TaskRunning);
+        
+        // Desabilita interrupções e congela o chip para podermos ler o log
+        __asm__ volatile("csrci mstatus, 0x8"); 
+        while(1); 
+    }
+}
+
+// --- VETORES NAKED DE INTERRUPÇÃO ---
+__attribute__((naked, section(".iram1")))
+void timer_vector(void) {
+    __asm__ volatile (
+        SAVE_CONTEXT
+        "mv a0, sp \n\t"          // Passa o SP atual como argumento
+        "call handle_timer \n\t"  // Chama a lógica C
+        "mv sp, a0 \n\t"          // Assume o SP retornado (pode ser de outra tarefa)
+        RESTORE_CONTEXT
+    );
+}
+
+__attribute__((naked, section(".iram1")))
+void ecall_vector(void) {
+    __asm__ volatile (
+        SAVE_CONTEXT
+        "mv a0, sp \n\t"          
+        "call handle_ecall \n\t"  
+        "mv sp, a0 \n\t"          
+        RESTORE_CONTEXT
+    );
+}
+
+void wakeUP() //acorda a task bloqueada a espera de passagem de tempo
+{
+  int i=1;
+  for(i=1;i<NUM_TASKS; i++)
+  {
+    //sleep
+    if(Descriptors[i].Time>0)
+    {
+      Descriptors[i].Time--;
+      if(Descriptors[i].Time <= 0 && Descriptors[i].State == BLOCKED && Descriptors[i].State != READY)
+      {
+        Descriptors[i].State = READY;
+        InsertReadyList(i) ; //tempo de espera se esgotou
+      }
+    }
+
+    if(Descriptors[i].DynamicPeriod>0)
+    {
+      Descriptors[i].DynamicPeriod--;
+      if(Descriptors[i].DynamicPeriod <= 0) {
+        Descriptors[i].DynamicPeriod = Descriptors[i].Period;
+        Descriptors[i].DynamicWcet = Descriptors[i].Wcet;
+        if(i != TaskRunning && Descriptors[i].State != READY) { // ← só insere se não estiver rodando
+            Descriptors[i].State = READY;
+            InsertReadyList(i);
+        }
+      }
+    }
+  }
+
+  if(Descriptors[TaskRunning].DynamicWcet>0)
+  {
+    Descriptors[TaskRunning].DynamicWcet--;
+    if(Descriptors[TaskRunning].DynamicWcet <= 0)
+    {
+      Descriptors[TaskRunning].State = BLOCKED;
+    }
+  }
+}
+
+//Escalonador
+
+/*
+* Imprime a Ready List
+* Usada para  testes
+*/
+void printReadyList() {
+    nkprint("Ready list tasks: ", 0);
+    for (int i = 0; i < ready_queue.head; i++) {
+        nkprint(" Index:", 0);
+        nkprint("%d", (void *)&ready_queue.queue[i]);
+    }
+    nkprint("\n", 0);
+}
+
+
+/*
+* Insere a task no final da Ready List
+*  sortReadyList() realizada na switchTask()
+*/
+void InsertReadyList(int id) {
+    // verifica se já está na lista
+    for (int i = 0; i < ready_queue.head; i++) {
+        if (ready_queue.queue[i] == id) return;
+    }
+    ready_queue.queue[ready_queue.head] = id;
+    ready_queue.head++;
+}
+
+
+/*
+*   
+* Se a task atual n o   Idle (TaskRunning != 0), a task   removida da Ready List
+* Caso n o esteja bloqueada, ela   reinserida no final da Ready List
+* A remo  o   feita com o deslocamento para a esquerda 
+* Chama a fun  o sortReadyList()
+* Atualiza TaskRunning com a primeira task da Ready List (TaskRunning = ready_queue.queue[0])
+* Se a Ready List estiver vazia, TaskRunning ser  0 (Idle) 
+*
+*/
+
+void switchTask() {
+    //saveContext(&Descriptors[TaskRunning]);
+    switchTaskUnsafe();
+    //restoreContext(&Descriptors[TaskRunning]);
+}
+
+void switchTaskUnsafe() {    
+
+  if (TaskRunning != 0){
+    for (int i = 0; i < ready_queue.head - 1; i++) {
+      ready_queue.queue[i] = ready_queue.queue[i + 1];
+    }
+    ready_queue.head--;
+    if (Descriptors[TaskRunning].State != BLOCKED)  {   
+
+      // >>> ADICIONE ESTA LINHA ABAIXO <<<
+      Descriptors[TaskRunning].State = READY;
+      InsertReadyList(TaskRunning);   
+    }
+  }
+  sortReadyList();
+  if (ready_queue.head > 0){
+    TaskRunning = ready_queue.queue[0];
+  } else {
+    TaskRunning = 0;
+  }
+  
+  Descriptors[TaskRunning].State = RUNNING;
+}
+
+/*
+*   
+* Algoritmo Bubble Sort para a reordena o da Ready List
+* O crit rio de ordena  o   a prioridade (Prio) definida para a task
+* Menor valor n merico indica maior prioridade
+*
+*/
+void sortReadyList() {
+  for (int i = 0; i < ready_queue.head - 1; i++) {
+      for (int j = 0; j < ready_queue.head - i - 1; j++) {
+          if (Descriptors[ready_queue.queue[j]].Period > Descriptors[ready_queue.queue[j + 1]].Period) {
+              int temp = ready_queue.queue[j];
+              ready_queue.queue[j] = ready_queue.queue[j + 1];
+              ready_queue.queue[j + 1] = temp;
+          }
+      }
+  }
+}
+
+
+// =============================================================================
+// ISRs
+// =============================================================================
+
+
+
+//Trata a interrupcao do Timer
+
+// __attribute__((naked, section(".iram1")))
+// void systemContext(void) { //Chamada pela interrupcao do Timer
+//     saveContext(&Descriptors[TaskRunning]);
+
+//     uint32_t mepc_val;
+//     asm volatile("csrr %0, mepc" : "=r"(mepc_val));
+//     printf("systemContext: TaskRunning=%d mepc=0x%08x\n", TaskRunning, mepc_val);
+
+//     wakeUP();
+//    //serialEvent();
+//     switchTaskUnsafe();
+//     processPrintQueue();
+//     SYSTIMER_INT_CLR = (1U << 0);
+//     (void)SYSTIMER_INT_ST;                  // APB flush
+    
+//     restoreContext(&Descriptors[TaskRunning]);
+// }
+
+/*
+*
+* Idle Process - executa quando ready list vazia
+*
+*/
+void idle() {
+    gpio_write(LED_PIN, 0);
+    printf("'idle' started with TID: %d\n", 0);
+     while (1) {
+        wdt_disable();  // ← adicione isso
+     } ;
+}
+/*
+*
+* Rotinas do kernel - Sys Call
+*
+*/
+
+//Isso aqui também foi alterdo é necessário revisar
+void sys_taskcreate(int *tid, void (*taskFunction)(void), uint8_t period, uint8_t wcet) {
+    NumberTaskAdd++;
+    *tid = NumberTaskAdd;
+    Descriptors[NumberTaskAdd].Tid = *tid;
+    Descriptors[NumberTaskAdd].State = READY;
+    Descriptors[NumberTaskAdd].Join = 0;
+    Descriptors[NumberTaskAdd].Time = 0;
+    Descriptors[NumberTaskAdd].Period = period;
+    Descriptors[NumberTaskAdd].Wcet = wcet;
+    Descriptors[NumberTaskAdd].DynamicPeriod = period;
+    Descriptors[NumberTaskAdd].DynamicWcet = wcet;
+
+    printf("Creating task with TID: %d, Function: %p, Period: %d, WCET: %d\n", *tid, taskFunction, period, wcet);
+
+    // Calcula o topo da pilha alinhado em 16 bytes
+    uint8_t *stackTop = (uint8_t *)((uintptr_t)(Descriptors[*tid].Stack + SizeTaskStack) & ~0xF);
+    
+    // Posiciona o contexto exatamente 128 bytes abaixo do topo
+    Context *ctx = (Context *)(stackTop - sizeof(Context));
+    memset(ctx, 0, sizeof(Context)); // Zera tudo (incluindo registradores de uso geral)
+    
+    ctx->mepc = (uint32_t)taskFunction; // Onde a tarefa começa a rodar
+    ctx->mstatus = 0x1880;              // Interrupções habilitadas, modo de máquina
+
+    // O Stack Pointer da tarefa aponta DIRETAMENTE para a estrutura Context
+    Descriptors[*tid].P = (uint8_t *)ctx;
+}
+
+
+
+void sys_start(int scheduler) {
+    int i;
+    SchedulerAlgorithm = scheduler;
+    switch (SchedulerAlgorithm) {
+        case RR:
+            for (i = 1; i <= NumberTaskAdd; i++) {
+                InsertReadyList(i);
+            }
+            sortReadyList();
+            break;
+        default:
+            break;
+    }
+}
+
+void sys_getmynumber(int *number)
+{
+  *number=Descriptors[TaskRunning].Tid ;
+}
+
+void sys_ligaled()
+{
+  //PORTB = PORTB | 0x20;
+}
+
+void sys_desligaled()
+{
+  //PORTB = PORTB & 0xDF;
+}
+
+void sys_setmyname(const char *name)
+{
+  Descriptors[TaskRunning].name=name;
+}
+
+void sys_getmyname(const char *name)
+{
+  strcpy(name, Descriptors[TaskRunning].name);
+}
+
+void sys_semwait(sem_t *semaforo)
+{   
+    semaforo->count--;
+    if(semaforo->count < 0)
+    {
+      semaforo->sem_queue[semaforo->tail] = TaskRunning;
+      Descriptors[TaskRunning].State = BLOCKED ;
+      semaforo->tail++;
+      if(semaforo->tail == MaxNumberTask-1) semaforo->tail = 0;
+      switchTask();
+    }
+}
+
+void sys_sempost(sem_t *semaforo)
+{
+     semaforo->count++;
+     if(semaforo->count <= 0)
+     {
+       Descriptors[semaforo->sem_queue[semaforo->header]].State = READY;
+       InsertReadyList(semaforo->sem_queue[semaforo->header]);
+       semaforo->header++;
+       if(semaforo->header == MaxNumberTask-1) semaforo->header = 0;
+     }
+}
+
+void sys_seminit(sem_t *semaforo, int ValorInicial)
+{
+  semaforo->count = ValorInicial;
+  semaforo->header = 0;
+  semaforo->tail = 0;
+}
+
+void sys_sleep(unsigned int segundo)
+{
+  //Descriptors[TaskRunning].Time = segundo/ClkT;
+  Descriptors[TaskRunning].Time = (segundo*1000000)/Slice ;
+  if(Descriptors[TaskRunning].Time > 0)
+  {
+    Descriptors[TaskRunning].State = BLOCKED;
+    switchTask();
+    
+    //select() ;
+  }
+}
+void sys_msleep(unsigned int mili)
+{
+  Descriptors[TaskRunning].Time = (mili/ClkT)/1000;
+  if(Descriptors[TaskRunning].Time > 0)
+  {
+    Descriptors[TaskRunning].State = BLOCKED;
+    switchTask();
+  }
+}
+
+void sys_usleep(unsigned int micro)
+{
+  Descriptors[TaskRunning].Time = (micro/ClkT)/1000000;
+  if(Descriptors[TaskRunning].Time > 0)
+  {
+    Descriptors[TaskRunning].State = BLOCKED;
+    switchTask();
+  }
+}
+
+void sys_rmssleep(void)
+{
+  if(Descriptors[TaskRunning].State == RUNNING)
+  {
+    Descriptors[TaskRunning].State = BLOCKED;
+    switchTask();
+  }
+}
+
+/*
+*  calcularPrecisao( float valor) chamada pela sys_nkprint
+*/
+static inline int calcularPrecisao( float valor)
+{
+  int PRECISAO_FLOAT_ARDUINO = 6;
+  int precisao = 0;
+  int valorInteiro = (int)valor;
+  while(valorInteiro > 0)
+  {
+    valorInteiro = valorInteiro / 10;
+    precisao++;
+  }
+  return PRECISAO_FLOAT_ARDUINO - precisao;
+}
+
+void enqueueNkPrint(int tid, const char *format, void *var) {
+    while(printTailMutex == true); // Espera se printTailMutex estiver ocupado
+    printTailMutex = true; // Bloqueia o printTailMutex
+    
+    char type = 'd';
+    if (strchr(format, '%')) {
+      char *percent = strchr(format, '%');
+      switch (*(percent + 1)) {
+        case 'd': type = 'd'; break;
+        case 'f': type = 'f'; break;
+        case 'c': type = 'c'; break;
+        case 's': type = 's'; break;
+        case '%': type = '%'; break;
+      }
+    }
+
+    nkprintQueue[nkprintQueueTail].format = format;
+    nkprintQueue[nkprintQueueTail].type = type;
+
+    switch (type) {
+      case 'd':
+        if (var != NULL)
+            nkprintQueue[nkprintQueueTail].var.i = *(int *)var;
+        else
+            nkprintQueue[nkprintQueueTail].var.i = 0;
+        break;
+      case 'f':
+        nkprintQueue[nkprintQueueTail].var.f = *(float *)var;
+        break;
+      case 'c':
+        nkprintQueue[nkprintQueueTail].var.c = *(char *)var;
+        break;
+      case 's':
+        nkprintQueue[nkprintQueueTail].var.s = (const char *)var;
+        break;
+      default:
+        break;
+    }
+
+    nkprintQueueTail = (nkprintQueueTail + 1) % MAX_NKPRINT_QUEUE;
+    printTailMutex = false; // Libera o printTailMutex
+}
+
+NkPrintQueueEntry dequeueNkPrint() {
+    while(printHeadMutex == true); // Espera se printHeadMutex estiver ocupado
+    printHeadMutex = true; // Bloqueia o printHeadMutex
+    NkPrintQueueEntry entry = nkprintQueue[nkprintQueueHead];
+    nkprintQueueHead = (nkprintQueueHead + 1) % MAX_NKPRINT_QUEUE;
+    printHeadMutex = false; // Libera o printHeadMutex
+    return entry;
+}
+
+void sys_nkprint(const char *format, void *var) {
+  // Adicionar a mensagem na fila de escrita
+  enqueueNkPrint(Descriptors[TaskRunning].Tid, format, var);
+  //switchTask();
+}
+
+void serial_print(const char *fmt, NkPrintQueueEntry entry)
+{
+    switch(entry.type)
+    {
+        case 'd':
+            printf(fmt, entry.var.i);
+            break;
+
+        case 'c':
+            printf(fmt, entry.var.c);
+            break;
+
+        case 's':
+            printf(fmt, entry.var.s);
+            break;
+
+        case '%':
+            printf("%%");
+            break;
+
+        default:
+            printf("Formato invalido");
+            break;
+    }
+}
+
+void processPrintQueue() {
+  while (printTailMutex);
+  printTailMutex = true;
+  int snapshotTail = nkprintQueueTail;
+  printTailMutex = false;
+
+  while (nkprintQueueHead != snapshotTail) {
+    NkPrintQueueEntry entry = dequeueNkPrint();
+    serial_print((char *)entry.format, entry);
+  }
+}
+
+
+void sys_taskexit(void)
+{
+  Descriptors[TaskRunning].State=BLOCKED;
+  switchTask();
+}
+void enqueueNkRead(int tid, const char *format, void *var) {
+    nkreadQueue[nkreadQueueTail].tid = tid;
+    nkreadQueue[nkreadQueueTail].format = format;
+    nkreadQueue[nkreadQueueTail].var = var;
+    nkreadQueueTail = (nkreadQueueTail + 1) % MAX_NKREAD_QUEUE;
+}
+
+NkReadQueueEntry dequeueNkRead() {
+    NkReadQueueEntry entry = nkreadQueue[nkreadQueueHead];
+    nkreadQueueHead = (nkreadQueueHead + 1) % MAX_NKREAD_QUEUE;
+    return entry;
+}
+
+void sys_nkread(const char *format, void *var) {
+  // Adicionar a thread atual na fila de leitura
+  enqueueNkRead(Descriptors[TaskRunning].Tid, format, var);
+  // Bloquear a thread atual
+  Descriptors[TaskRunning].State = BLOCKED;
+  switchTask();
+}
+
+float stringToFloat(const char* str) {
+    float result = 0.0;
+    float factor = 1.0;
+
+    if (*str == '-') {
+        str++;
+        factor = -1.0;
+    }
+
+    // Parte inteira
+    for (; *str >= '0' && *str <= '9'; str++) {
+        result = result * 10.0 + (*str - '0');
+    }
+
+    // Parte fracion?ria
+    if (*str == '.') {
+        float fraction = 0.1;
+        str++;
+        for (; *str >= '0' && *str <= '9'; str++) {
+            result += (*str - '0') * fraction;
+            fraction *= 0.1;
+        }
+    }
+
+    return result * factor;
+}
+
+// void serialEvent() {
+//     while (Serial.available()) {
+//         char c = Serial.read();
+//         if (c == '\n') {
+//             serialInputBuffer[serialInputIndex] = '\0';  // Termina a string
+//             serialInputIndex = 0;  // Reinicia o ?ndice
+
+//             // Desbloquear a thread que esta esperando por entrada
+//             if (nkreadQueueHead != nkreadQueueTail) {
+//                 NkReadQueueEntry entry = dequeueNkRead();
+//                 if (strcmp(entry.format, "%f") == 0) {
+//                     // Para float, usar nossa fun??o auxiliar
+//                     *(float *)(entry.var) = stringToFloat(serialInputBuffer);
+//                 } else {
+//                     // Interpretar a entrada de acordo com o formato fornecido
+//                     sscanf(serialInputBuffer, entry.format, entry.var);
+//                 }
+//                 Descriptors[entry.tid].State = READY;
+//             }
+//         } else {
+//             if (serialInputIndex < 127) {
+//                 serialInputBuffer[serialInputIndex++] = c;
+//             }
+//         }
+//     }
+// }
+
+
+/*************************************************************
+*                                                            *
+* Chamadas de Sistema a N vel de usu rio                     *
+*           User Call                                        *
+*                                                            *
+*************************************************************/
+
+void taskcreate(int *ID,void (*funcao)(), uint8_t period, uint8_t wcet) //parametros armazenados em R0 e R1 na chamada
+{
+  Parameters arg;
+  printf("taskcreate called with funcao=%p, period=%d, wcet=%d\n", funcao, period, wcet); // Debug
+  arg.CallNumber=TASKCREATE;
+  arg.p0=(unsigned char *)ID;
+  arg.p1=(unsigned char *)funcao;
+  arg.p2=(unsigned char *)(uint16_t)period;
+  arg.p3=(unsigned char *)(uint16_t)wcet;
+  callsvc(&arg);
+}
+void start(int scheduler)
+{
+  Parameters arg;
+  arg.CallNumber=START;
+  arg.p0=(unsigned char *)scheduler;
+  callsvc(&arg);
+}
+void semwait(sem_t *semaforo)
+{
+  Parameters arg;
+  arg.CallNumber=SEM_WAIT;
+  arg.p0=(unsigned char *)semaforo;
+  callsvc(&arg);
+}
+
+void sempost(sem_t *semaforo)
+{
+  Parameters arg;
+  arg.CallNumber=SEM_POST;
+  arg.p0=(unsigned char *)semaforo;
+  callsvc(&arg);
+}
+
+void seminit(sem_t *semaforo, int ValorInicial)
+{
+  Parameters arg;
+  arg.CallNumber=SEM_INIT;
+  arg.p0=(unsigned char *)semaforo;
+  arg.p1=(unsigned char *)ValorInicial;
+  callsvc(&arg);
+}
+void setmyname(const char *name)
+{
+  Parameters arg;
+  arg.CallNumber=SETMYNAME;
+  arg.p0=(unsigned char *)name;
+  callsvc(&arg);
+}
+void getmynumber(int *number)
+{
+  Parameters arg;
+  arg.CallNumber=GETMYNUMBER;
+  arg.p0=(unsigned char *)number;
+  callsvc(&arg);
+}
+void getmyname(const char *name)
+{
+  Parameters arg;
+  arg.CallNumber=GETMYNAME;
+  arg.p0=(unsigned char *)name;
+  callsvc(&arg);
+}
+void sleep(int time)
+{
+  Parameters arg;
+  arg.CallNumber=SLEEP;
+  arg.p0=(unsigned char *)time;
+  callsvc(&arg);
+}
+void msleep(int time)
+{  
+  Parameters arg;
+  arg.CallNumber=SLEEP;
+  arg.CallNumber=MSLEEP;
+  arg.p0=(unsigned char *)time;
+  callsvc(&arg);
+}
+
+void usleep(int time)
+{
+  Parameters arg;
+  arg.CallNumber=USLEEP;
+  arg.p0=(unsigned char *)time;
+  callsvc(&arg);
+}
+void rmssleep(void)
+{
+  Parameters arg;
+  arg.CallNumber=RMSSLEEP;
+  callsvc(&arg);
+}
+void taskexit(void)
+{
+  Parameters arg;
+  arg.CallNumber=EXITTASK;
+  callsvc(&arg);
+}
+
+void ligaled(void)
+{
+  Parameters arg;
+  arg.CallNumber=LIGALED;
+  callsvc(&arg);
+}
+
+void desligaled(void)
+{
+  Parameters arg;
+  arg.CallNumber=DESLIGALED;
+  callsvc(&arg);
+}
+
+void nkprint(char *fmt,void *number)
+{
+  Parameters arg;
+  arg.CallNumber=NKPRINT;
+  arg.p0=(unsigned char *)fmt;
+  arg.p1=(unsigned char *)number;
+  callsvc(&arg);
+}
+void nkread(const char *format, void *var) {
+    Parameters arg;
+    arg.CallNumber = NKREAD;
+    arg.p0 = (unsigned char *)format;
+    arg.p1 = (unsigned char *)var;
+    callsvc(&arg);
+}
+/*************************************************************
+*                                                            *
+*                   Programa do  usu rio                     *
+*                       - Aplica  o -                        *
+*                                                            *
+*************************************************************/
+
+
+volatile int16_t tid0, tid1, tid2, tid3, tid4;
+int i, j ;
+//sem_t s0;
+//sem_t s1;
+//sem_t s2;
+//sem_t s3;
+
+void p0() { 
+    
+  printf("'p0' started with TID: %d\n", 0);
+  static int number0;
+  getmynumber(&number0);  
+  while (1) {
+    //rintReadyList();
+    nkprint("P0 running\n", 0);
+    for(volatile long d = 0; d < (817200L); d++);
+    nkprint("P0 Finished\n", 0);
+    rmssleep();
+  }
+}
+
+void p1() {
+  printf("'p1' started with TID: %d\n", 1);
+  static int number1;
+  getmynumber(&number1);
+  while (1) {
+    //printReadyList();
+    nkprint("P1 running\n", 0);
+    for(volatile long d = 0; d < 1816000L; d++);
+    nkprint("P1 Finished\n", 0);
+    rmssleep();
+  }
+}
+
+void p2() {
+  printf("'p2' started with TID: %d\n", 2);
+  static int number2;
+  getmynumber(&number2);
+  while (1) {
+    //printReadyList();
+    nkprint("P2 running\n", 0);
+    for(volatile long d = 0; d < 2724000L; d++);
+    nkprint("P2 Finished\n", 0);
+    rmssleep();
+  }
+}
+
+/*************************************************************
+*                                                            *
+*               Setup e criar Tasks                    *
+*                                                            *
+*                                                            *
+*************************************************************/
+
+// =============================================================================
+// VECTOR TABLE — modo vetorizado: interrupção N → base + N*4
+// =============================================================================
+extern void real_vector_table(void);
+
+__attribute__((naked, section(".iram1")))
+void isr_vector_table(void) {
+    __asm__ volatile (
+        ".align 8\n"
+        ".global real_vector_table\n"
+        "real_vector_table:\n"
+        ".option push\n"
+        ".option norvc\n"
+        "j ecall_vector     \n"     // ID 0 - Nossas Syscalls via ecall!
+        "j .                \n"     // ID 1
+        "j .                \n"     // ID 2
+        "j .                \n"     // ID 3
+        "j .                \n"     // ID 4
+        "j .                \n"     // ID 5 
+        "j timer_vector     \n"     // ID 6 - Nosso Timer blindado!
+        ".option pop\n"
+    );
+}
+
+// Para substituir aquele último restoreContext no main()
+__attribute__((naked))
+void startOS(uint8_t* initial_sp) {
+    __asm__ volatile (
+        "mv sp, a0 \n\t"
+        RESTORE_CONTEXT
+    );
+}
+
+
+// =============================================================================
+// SYSTIMER INIT — período mode, procedimento exato do TRM 10.5.3
+// =============================================================================
+
+static void systimer_init(void) {
+    // Passo 0: habilita clock do registrador e UNIT0
+    // CLK_EN=bit31, UNIT0_WORK_EN=bit29
+    // TARGET0_WORK_EN=bit23 é setado DEPOIS do COMP0_LOAD (passo 5 do TRM)
+    SYSTIMER_CONF = (1U << 31) | (1U << 30);
+
+    // Passo 1: seleciona UNIT0 para COMP0 (TIMER_UNIT_SEL=bit31=0) e
+    //          escreve o período (bits 25:0) em TARGET0_CONF
+    //          PERIOD_MODE ainda em 0 aqui
+    SYSTIMER_TARGET0_CONF = Slice & 0x3FFFFFF;
+
+    // Passo 2: strobe COMP0_LOAD para sincronizar o período ao COMP0
+    SYSTIMER_COMP0_LOAD = 1;
+
+    // Passo 3: limpa e depois seta PERIOD_MODE (bit30) para entrar em modo período
+    SYSTIMER_TARGET0_CONF = Slice & 0x3FFFFFF;          // PERIOD_MODE=0
+    SYSTIMER_TARGET0_CONF = (1U << 30) | (Slice & 0x3FFFFFF); // PERIOD_MODE=1
+
+    // Passo 4: habilita COMP0 via CONF_REG bit23 (TARGET0_WORK_EN)
+    SYSTIMER_CONF = (1U << 31) | (1U << 30) | (1U << 24);
+
+    // Passo 5: habilita interrupção do COMP0 (bit0)
+    SYSTIMER_INT_CLR = (1U << 0);
+    SYSTIMER_INT_ENA = (1U << 0);
+
+    // Roteamento INTMTX  ---OKKKKK
+    INTMTX_SYSTIMER_T0_MAP     = CPU_INTR_TIMER;
+    INTCTL_ENABLE             |= (1U << CPU_INTR_TIMER);
+    INTCTL_PRI(CPU_INTR_TIMER) = 14;
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+
+int main(void) {
+    wdt_disable();
+    gpio_output(LED_PIN);
+    gpio_write(LED_PIN, 0);
+
+    delay_ms(4000);
+
+    wdt_disable();
+    gpio_output(LED_PIN);
+    gpio_write(LED_PIN, 1);
+
+    INTCTL_CLEAR              = 0xFFFFFFFF;
+    INTCTL_TYPE               = 0;
+    INTCTL_THRESH             = 0;
+    
+    // ==================== RISC-V CORE ====================
+    __asm__ volatile ("csrw mtvec, %0" :: "r"((uintptr_t)real_vector_table | 1U));
+    __asm__ volatile ("csrsi mstatus, 0x8");
+
+            
+    nkprint("FakeOS \n", 0) ;
+
+    nkprint("Versao 0.0 \n", 0) ;
+    
+    //seminit(&s0, 1);
+    //seminit(&s1, 0);
+    //seminit(&s2, 0);
+    //seminit(&s3, 0);
+    
+    taskcreate(&tid0,idle,100, 50);
+    taskcreate(&tid1,p0,10, 2);
+    taskcreate(&tid2,p1,20, 5);
+    taskcreate(&tid3,p2,30, 8);
+    // taskcreate(&tid3,p3,1);
+
+    printf("Before start RR: TaskRunning=%d\n", TaskRunning); // Debug
+    start (RR) ; //coloca as tasks na fila
+    
+    systimer_init();
+
+    os_started = true;
+    startOS(Descriptors[0].P); //coloca a task idle para rodar (não vai executar até a interrupção, vai ficar no while (1))
+
+    while (1) {
+    }
+}
