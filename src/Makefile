@@ -10,7 +10,7 @@ CFLAGS      ?= -W -Wall -Wextra -Wundef -Wshadow -pedantic \
                -Os -ffunction-sections -fdata-sections \
                -I. -I$(MDK)/$(ARCH) -I$(MDK)/../include $(EXTRA_CFLAGS)
 LINKFLAGS ?= -T$(MDK)/$(ARCH)/link.ld -nostdlib -nostartfiles -Wl,--gc-sections,--undefined=isr1 $(EXTRA_LINKFLAGS)
-SOURCES = timer.c
+SOURCES = NKE.c
 CWD := $(realpath .)
 
 DOCKER := docker run -it --rm \
