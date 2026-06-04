@@ -132,7 +132,7 @@ typedef struct {
     uint32_t s2, s3, s4, s5, s6, s7, s8, s9, s10, s11;
     uint32_t t3, t4, t5, t6;
     uint32_t mstatus, mepc;
-    uint32_t padding1, padding2; // <-- CRUCIAL PARA DAR 128 BYTES (Múltiplo de 16)
+    uint32_t padding1, padding2;
 } Context;
 /*
 *Servicos do kernel
@@ -1228,7 +1228,7 @@ int main(void) {
     gpio_output(LED_PIN);
     gpio_write(LED_PIN, 0);
 
-    delay_ms(4000);
+    //delay_ms(4000);
 
     wdt_disable();
     gpio_output(LED_PIN);

@@ -7,10 +7,6 @@
 *.zip
 *.hex
 
-# Generated executables/files
-esputil
-esputils
-
 # Optional object files
 *.o
 *.a
@@ -31,3 +27,6 @@ esputils
 
 # macOS
 .DS_Store
+
+# mdk
+mdk/esputil/esputil
