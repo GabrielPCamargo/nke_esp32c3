@@ -7,7 +7,7 @@ ARCH        ?= esp32c3
 CFLAGS      ?= -W -Wall -Wextra -Wundef -Wshadow -pedantic \
                -Wdouble-promotion -fno-common -Wconversion \
                -march=rv32imc_zicsr -mabi=ilp32 \
-               -Os -ffunction-sections -fdata-sections \
+               -Os -ffunction-sections -fdata-sections -fno-builtin-printf\
                -I. -I$(MDK)/$(ARCH) -I$(MDK)/../include $(EXTRA_CFLAGS)
 LINKFLAGS ?= -T$(MDK)/$(ARCH)/link.ld -nostdlib -nostartfiles -Wl,--gc-sections,--undefined=isr1 $(EXTRA_LINKFLAGS)
 SOURCES = NKE.c

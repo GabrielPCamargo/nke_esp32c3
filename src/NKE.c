@@ -24,8 +24,7 @@
 */
 #define ClkT 2 //equivale a 2 segundos
 
-// SYSTIMER clock = 16 MHz → 1000 ms = 16_000_000 ticks
-// PERIOD field is 26 bits max (67 million), so 16_000_000 fits fine (1s)
+// SYSTIMER clock ESP32C3 = 16 MHz → 1000 ms = 16_000_000 ticks
 #define Slice 16000000UL //1 segundo
 #define MaxNumberTask 4
 #define NUM_TASKS 4
@@ -35,7 +34,6 @@
 #define MAX_NAME_LENGTH 30
 unsigned int NumberTaskAdd=-1;
 volatile int TaskRunning = 0;
-volatile bool os_started = false;
 char myName[MAX_NAME_LENGTH];
 int  SchedulerAlgorithm ;
 
@@ -168,17 +166,6 @@ enum sys_temCall{
 *                                                            *
 *************************************************************/
 
-__attribute__((naked)) void trap_return_ecall(void)
-{
-    __asm__ volatile (
-        "csrr t0, mepc \n\t"
-        "addi t0, t0, 4 \n\t"
-        "csrw mepc, t0 \n\t"
-        "mret\n\t"
-    );
-}
-
-
 void kernel(Parameters *args) {
     kernelargs = *args;
 
@@ -250,47 +237,9 @@ void kernel(Parameters *args) {
     default:
        break;
   }
-
-  //trap_return_ecall();
-}
-/*
-* Passa a executar a rotina do kernel com interrupcoes desabiitadas
-*
-*/
-// void callsvc(Parameters *args)
-// {
-//   noInterrupts();
-//   kernelargs = *args ;
-//   kernel() ;
-//   interrupts();
-// }
-
-// Chamada de sistema já desabilita interrupções, o parâmetro pointeiro args é colocado em a0 (registrador padrão pela ABI)
-
-// void callsvc(Parameters *args)
-// {
-//     register Parameters *a0 asm("a0") = args;
-
-//     asm volatile("csrci mstatus, 0x8");
-//     kernel(a0);
-//     asm volatile("csrsi mstatus, 0x8");
-// }
-
-void callsvc(Parameters *args)
-{
-    // 1. Forçamos o compilador a colocar o ponteiro 'args' no registrador a0.
-    // O registrador a0 é o padrão (ABI) para passar o primeiro argumento.
-    register Parameters *a0 asm("a0") = args;
-
-    // 2. Disparamos a exceção de hardware "Environment Call" (ecall).
-    // O hardware automaticamente pula para o 'ecall_vector' e salva o mepc atual!
-    __asm__ volatile("ecall" : : "r"(a0) : "memory");
 }
 
-/*
-*
-*
-*/
+
 // --- MACROS DE CONTEXTO ---
 #define SAVE_CONTEXT \
     "addi sp, sp, -128 \n\t" \
@@ -363,14 +312,16 @@ void callsvc(Parameters *args)
     "addi sp, sp, 128 \n\t" \
     "mret \n\t"
 
-// --- HANDLERS C SEGUROS ---
-// Estas funções recebem o SP da tarefa interrompida e retornam o SP da nova tarefa a rodar
-uint32_t handle_timer(uint32_t current_sp) {
-    if (!os_started) return current_sp; // Proteção extra para o timer
-    Descriptors[TaskRunning].P = (uint8_t *)current_sp;
-    
+
+void timer_interrupt_clear() {
     SYSTIMER_INT_CLR = (1U << 0);
     (void)SYSTIMER_INT_ST;
+}
+
+uint32_t handle_timer(uint32_t current_sp) {
+    // Salva o SP da tarefa atual no seu descritor para retornar depois
+    Descriptors[TaskRunning].P = (uint8_t *)current_sp;
+    timer_interrupt_clear();
     
     wakeUP();
     switchTaskUnsafe(); 
@@ -379,7 +330,6 @@ uint32_t handle_timer(uint32_t current_sp) {
     return (uint32_t)Descriptors[TaskRunning].P;
 }
 
-//Funcionou, mas não sei exatamente por qe precisa desse mcause_val (pois não teve fatal error)
 uint32_t handle_ecall(uint32_t current_sp) {
     uint32_t mcause_val;
     // Lê o registrador que nos diz O QUE causou a interrupção
@@ -387,12 +337,14 @@ uint32_t handle_ecall(uint32_t current_sp) {
 
     // mcause 8 = Syscall de Usuário | mcause 11 = Syscall de Máquina
     if (mcause_val == 8 || mcause_val == 11) {
+
         Context *ctx = (Context *)current_sp;
-        ctx->mepc += 4; // Apenas se for ecall, nós pulamos a instrução
+        ctx->mepc += 4; // mepc em exceção aponta para a instrução ECALL, então PC é incrementado para evitar loop infinito.
 
         Parameters *args = (Parameters *)ctx->a0;
 
-        if (!os_started) {
+        // Se ecall não foi chamada por uma tarefa (TaskRunning == 0), o kernel retorna pra próxima linha (utilizado na criação de tasks no main)
+        if (TaskRunning == 0) {
             kernel(args);
             return current_sp;
         }
@@ -402,22 +354,19 @@ uint32_t handle_ecall(uint32_t current_sp) {
         return (uint32_t)Descriptors[TaskRunning].P;
     } 
     else {
-        // --- TELA AZUL DA MORTE DO SEU KERNEL ---
-        // Caiu aqui? É um erro de memória ou ponteiro inválido!
+
+        // Outra exceção encontrada!
         Context *ctx = (Context *)current_sp;
-        printf("\n\n=== HARD FAULT DETECTADO ===%d\n", TaskRunning);
+        printf("\n\n=== EXCEÇÃO DETECTADA ===\n");
         printf("Codigo mcause : %u\n", mcause_val);
         printf("mepc (Erro em): 0x%08x\n", ctx->mepc);
         printf("TaskRunning   : %d\n", TaskRunning);
-        printf("============================%d\n", TaskRunning);
-        
-        // Desabilita interrupções e congela o chip para podermos ler o log
+
         __asm__ volatile("csrci mstatus, 0x8"); 
         while(1); 
     }
 }
 
-// --- VETORES NAKED DE INTERRUPÇÃO ---
 __attribute__((naked, section(".iram1")))
 void timer_vector(void) {
     __asm__ volatile (
@@ -433,11 +382,84 @@ __attribute__((naked, section(".iram1")))
 void ecall_vector(void) {
     __asm__ volatile (
         SAVE_CONTEXT
-        "mv a0, sp \n\t"          
-        "call handle_ecall \n\t"  
-        "mv sp, a0 \n\t"          
+        "mv a0, sp \n\t"          // Passa o SP atual como argumento
+        "call handle_ecall \n\t"  // Chama a lógica C
+        "mv sp, a0 \n\t"          // Assume o SP retornado (pode ser de outra tarefa)
         RESTORE_CONTEXT
     );
+}
+
+void callsvc(Parameters *args)
+{
+    // 1. Força o compilador a colocar o ponteiro 'args' no registrador a0.
+    // O registrador a0 é o padrão (ABI) para passar o primeiro argumento.
+    register Parameters *a0 asm("a0") = args;
+
+    // 2. Chama a exceção de hardware "Environment Call" (ecall).
+    // O hardware automaticamente pula para o 'ecall_vector'
+    __asm__ volatile("ecall" : : "r"(a0) : "memory");
+}
+
+
+//Função para iniciar a primeira tarefa. O ponteiro da pilha é enviado para a0 (procure ABI=ilp32 para mais informações)
+// O atributo naked é crucial para evitar que o compilador adicione prólogo/epílogo, dando controle total sobre o que acontece no início da tarefa.
+__attribute__((naked))
+void startOS(uint8_t* initial_sp) {
+    __asm__ volatile (
+        "mv sp, a0 \n\t"
+        RESTORE_CONTEXT
+    );
+}
+
+
+// Vetor de interrupção, sem prólogo/epílogo, alinhado em 256 bytes para garantir que cada ID de interrupção seja corretamente mapeada para seu handler.
+__attribute__((naked, section(".iram1"), aligned(256)))
+void vector_table(void)
+{
+    __asm__ volatile (
+        ".option push\n"    // salva opções atuais (antes de tirar o norvc)
+        ".option norvc\n"   // sem otimização de instruções comprimidas para garantir que cada salto seja exatamente 4 bytes (uma instrução RISC-V normal)
+
+        "j ecall_vector\n" // Handler de ecall (endereço base mtvec)
+        "j .\n"
+        "j .\n"
+        "j .\n"
+        "j .\n"
+        "j .\n"
+        "j timer_vector\n" // Handler de timer, id configurado na inialização do SYSTIMER
+
+        ".option pop\n"    // restaura opções anteriores (antes do norvc ser ativado
+    );
+}
+
+
+// SYSTIMER INIT — Modo período, procedimento exato do (Technical Reference Manual) TRM 10.5.3
+
+static void systimer_init(void) {
+    //Habilita clock do systimer geral e habilita a execução da UNIT0.
+    SYSTIMER_CONF = (1U << 31) | (1U << 30);
+
+    //Configura comparador 0, para timer da UNIT0 e período definido por Slice
+    SYSTIMER_TARGET0_CONF = Slice & 0x3FFFFFF;
+
+    //BIT 1 do COMP0_LOAD para sincronizar o período ao COMP0
+    SYSTIMER_COMP0_LOAD = 1;
+
+    // limpa e depois seta PERIOD_MODE (bit30) para entrar em modo período
+    SYSTIMER_TARGET0_CONF = Slice & 0x3FFFFFF;                // PERIOD_MODE=0
+    SYSTIMER_TARGET0_CONF = (1U << 30) | (Slice & 0x3FFFFFF); // PERIOD_MODE=1
+
+    // habilita COMP0 via CONF_REG bit23 (TARGET0_WORK_EN)
+    SYSTIMER_CONF = (1U << 31) | (1U << 30) | (1U << 24);
+
+    // Limpa e habilita interrupção do COMP0 (bit0)
+    SYSTIMER_INT_CLR = 1U;
+    SYSTIMER_INT_ENA = 1U;
+
+    // Roteamento INTMTX_SYSTIMER_T0 para CPU_INTR_TIMER e habilitação da interrupção no controlador
+    INTMTX_SYSTIMER_T0_MAP     = CPU_INTR_TIMER;
+    INTCTL_ENABLE             |= (1U << CPU_INTR_TIMER);
+    INTCTL_PRI(CPU_INTR_TIMER) = 2; // Prioridade média-baixa para não atrapalhar outras ISRs críticas
 }
 
 void wakeUP() //acorda a task bloqueada a espera de passagem de tempo
@@ -523,6 +545,7 @@ void InsertReadyList(int id) {
 
 void switchTask() {
     //saveContext(&Descriptors[TaskRunning]);
+
     switchTaskUnsafe();
     //restoreContext(&Descriptors[TaskRunning]);
 }
@@ -536,7 +559,6 @@ void switchTaskUnsafe() {
     ready_queue.head--;
     if (Descriptors[TaskRunning].State != BLOCKED)  {   
 
-      // >>> ADICIONE ESTA LINHA ABAIXO <<<
       Descriptors[TaskRunning].State = READY;
       InsertReadyList(TaskRunning);   
     }
@@ -569,33 +591,6 @@ void sortReadyList() {
       }
   }
 }
-
-
-// =============================================================================
-// ISRs
-// =============================================================================
-
-
-
-//Trata a interrupcao do Timer
-
-// __attribute__((naked, section(".iram1")))
-// void systemContext(void) { //Chamada pela interrupcao do Timer
-//     saveContext(&Descriptors[TaskRunning]);
-
-//     uint32_t mepc_val;
-//     asm volatile("csrr %0, mepc" : "=r"(mepc_val));
-//     printf("systemContext: TaskRunning=%d mepc=0x%08x\n", TaskRunning, mepc_val);
-
-//     wakeUP();
-//    //serialEvent();
-//     switchTaskUnsafe();
-//     processPrintQueue();
-//     SYSTIMER_INT_CLR = (1U << 0);
-//     (void)SYSTIMER_INT_ST;                  // APB flush
-    
-//     restoreContext(&Descriptors[TaskRunning]);
-// }
 
 /*
 *
@@ -835,6 +830,7 @@ void sys_nkprint(const char *format, void *var) {
 
 void serial_print(const char *fmt, NkPrintQueueEntry entry)
 {
+  float *auxfloat;
     switch(entry.type)
     {
         case 'd':
@@ -845,12 +841,16 @@ void serial_print(const char *fmt, NkPrintQueueEntry entry)
             printf(fmt, entry.var.c);
             break;
 
+        //Sem suporte para soft float com esse toolchain.
+        case 'f':
+          break;
+
         case 's':
             printf(fmt, entry.var.s);
             break;
 
         case '%':
-            printf("%%");
+            printf(fmt);
             break;
 
         default:
@@ -1104,16 +1104,19 @@ int i, j ;
 //sem_t s3;
 
 void p0() { 
-    
-  printf("'p0' started with TID: %d\n", 0);
-  static int number0;
-  getmynumber(&number0);  
+  static int number3;
+  int teste = 10;
+  char teste2 = 'A';
+  float teste3 = 3.14159;
+  char teste4[20] = "Hello, World!";
+  getmynumber(&number3);
   while (1) {
-    //rintReadyList();
-    nkprint("P0 running\n", 0);
-    for(volatile long d = 0; d < (817200L); d++);
-    nkprint("P0 Finished\n", 0);
-    rmssleep();
+    nkprint("P3 running\n", 0);
+    nkprint("int: %d\n", &teste);
+    nkprint("char: %c\n", &teste2);
+    nkprint("percent: %%\n", 0);
+    nkprint("string: %s\n", &teste4);
+    sleep(2);
   }
 }
 
@@ -1150,101 +1153,20 @@ void p2() {
 *                                                            *
 *************************************************************/
 
-// =============================================================================
-// VECTOR TABLE — modo vetorizado: interrupção N → base + N*4
-// =============================================================================
-extern void real_vector_table(void);
-
-__attribute__((naked, section(".iram1")))
-void isr_vector_table(void) {
-    __asm__ volatile (
-        ".align 8\n"
-        ".global real_vector_table\n"
-        "real_vector_table:\n"
-        ".option push\n"
-        ".option norvc\n"
-        "j ecall_vector     \n"     // ID 0 - Nossas Syscalls via ecall!
-        "j .                \n"     // ID 1
-        "j .                \n"     // ID 2
-        "j .                \n"     // ID 3
-        "j .                \n"     // ID 4
-        "j .                \n"     // ID 5 
-        "j timer_vector     \n"     // ID 6 - Nosso Timer blindado!
-        ".option pop\n"
-    );
-}
-
-// Para substituir aquele último restoreContext no main()
-__attribute__((naked))
-void startOS(uint8_t* initial_sp) {
-    __asm__ volatile (
-        "mv sp, a0 \n\t"
-        RESTORE_CONTEXT
-    );
-}
-
-
-// =============================================================================
-// SYSTIMER INIT — período mode, procedimento exato do TRM 10.5.3
-// =============================================================================
-
-static void systimer_init(void) {
-    // Passo 0: habilita clock do registrador e UNIT0
-    // CLK_EN=bit31, UNIT0_WORK_EN=bit29
-    // TARGET0_WORK_EN=bit23 é setado DEPOIS do COMP0_LOAD (passo 5 do TRM)
-    SYSTIMER_CONF = (1U << 31) | (1U << 30);
-
-    // Passo 1: seleciona UNIT0 para COMP0 (TIMER_UNIT_SEL=bit31=0) e
-    //          escreve o período (bits 25:0) em TARGET0_CONF
-    //          PERIOD_MODE ainda em 0 aqui
-    SYSTIMER_TARGET0_CONF = Slice & 0x3FFFFFF;
-
-    // Passo 2: strobe COMP0_LOAD para sincronizar o período ao COMP0
-    SYSTIMER_COMP0_LOAD = 1;
-
-    // Passo 3: limpa e depois seta PERIOD_MODE (bit30) para entrar em modo período
-    SYSTIMER_TARGET0_CONF = Slice & 0x3FFFFFF;          // PERIOD_MODE=0
-    SYSTIMER_TARGET0_CONF = (1U << 30) | (Slice & 0x3FFFFFF); // PERIOD_MODE=1
-
-    // Passo 4: habilita COMP0 via CONF_REG bit23 (TARGET0_WORK_EN)
-    SYSTIMER_CONF = (1U << 31) | (1U << 30) | (1U << 24);
-
-    // Passo 5: habilita interrupção do COMP0 (bit0)
-    SYSTIMER_INT_CLR = (1U << 0);
-    SYSTIMER_INT_ENA = (1U << 0);
-
-    // Roteamento INTMTX  ---OKKKKK
-    INTMTX_SYSTIMER_T0_MAP     = CPU_INTR_TIMER;
-    INTCTL_ENABLE             |= (1U << CPU_INTR_TIMER);
-    INTCTL_PRI(CPU_INTR_TIMER) = 14;
-}
-
-// =============================================================================
-// MAIN
-// =============================================================================
-
 int main(void) {
-    wdt_disable();
-    gpio_output(LED_PIN);
-    gpio_write(LED_PIN, 0);
-
-    //delay_ms(4000);
-
-    wdt_disable();
-    gpio_output(LED_PIN);
-    gpio_write(LED_PIN, 1);
-
-    INTCTL_CLEAR              = 0xFFFFFFFF;
-    INTCTL_TYPE               = 0;
-    INTCTL_THRESH             = 0;
+    // Desabilita o Watchdog para evitar resets inesperados durante o desenvolvimento
+    wdt_disable(); 
     
-    // ==================== RISC-V CORE ====================
-    __asm__ volatile ("csrw mtvec, %0" :: "r"((uintptr_t)real_vector_table | 1U));
-    __asm__ volatile ("csrsi mstatus, 0x8");
+    //Configura o vetor de interrupção.
+    __asm__ volatile ("csrw mtvec, %0" :: "r"((uintptr_t)vector_table)); 
 
-            
+    // Habilita interrupções globalmente (MIE=1)
+    // Não é necessário pois cada tarefa tem seu próprio mstatus com MIE=1
+    //__asm__ volatile ("csrsi mstatus, 0x8"); 
+    
+
+    // Verificar número das interrupções, talvez seja melhor trocar os defines para esse código.        
     nkprint("FakeOS \n", 0) ;
-
     nkprint("Versao 0.0 \n", 0) ;
     
     //seminit(&s0, 1);
@@ -1258,14 +1180,13 @@ int main(void) {
     taskcreate(&tid3,p2,30, 8);
     // taskcreate(&tid3,p3,1);
 
-    printf("Before start RR: TaskRunning=%d\n", TaskRunning); // Debug
-    start (RR) ; //coloca as tasks na fila
+    start (RR) ;
     
     systimer_init();
 
-    os_started = true;
     startOS(Descriptors[0].P); //coloca a task idle para rodar (não vai executar até a interrupção, vai ficar no while (1))
 
-    while (1) {
-    }
+    // O código do main() não deve rodar nada, pois a task idle() já deve começar a executar.
+    printf("Erro: main() foi executado! Isso não deveria acontecer.\n");
+    while(1); 
 }
