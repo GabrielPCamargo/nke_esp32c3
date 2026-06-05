@@ -536,8 +536,22 @@ static void monitor(struct ctx *ctx) {
   if (ready & 1) {  // Forward stdin to a device
     uint8_t buf[BUFSIZ];
     int n = read(0, buf, sizeof(buf));
-    if (n > 0 && ctx->verbose) dump("WRITE", buf, n);
-    for (i = 0; i < n; i++) uart_tx(buf[i], &ctx->fd);
+
+    if (n > 0 && ctx->verbose)
+      dump("WRITE", buf, n);
+
+    if (n > 0) {
+      int total = 0;
+
+      while (total < n) {
+        int rc = write(ctx->fd, buf + total, n - total);
+
+        if (rc <= 0)
+          fail("failed to write to fd %d", ctx->fd);
+
+        total += rc;
+      }
+    }
   }
   if (ready & 4) {  // Something in the UDP socket
     uint8_t buf[2048];

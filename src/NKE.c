@@ -324,6 +324,7 @@ uint32_t handle_timer(uint32_t current_sp) {
     timer_interrupt_clear();
     
     wakeUP();
+    serialEvent();
     switchTaskUnsafe(); 
     processPrintQueue();
     
@@ -828,6 +829,41 @@ void sys_nkprint(const char *format, void *var) {
   //switchTask();
 }
 
+void print_float_custom(float valor, int precisao) {
+    // 1. Lida com números negativos
+    if (valor < 0.0) {
+        printf("-");
+        valor = -valor;
+    }
+
+    // 2. Aplica arredondamento básico com base na precisão
+    float arredondamento = 0.5;
+    for (int i = 0; i < precisao; ++i) {
+        arredondamento /= 10.0;
+    }
+    valor += arredondamento;
+
+    // 3. Extrai a parte inteira
+    int parte_inteira = (int)valor;
+    
+    // 4. Extrai a parte fracionária
+    float parte_fracionaria = valor - (float)parte_inteira;
+
+    // 5. Imprime a parte inteira
+    printf("%d", parte_inteira);
+
+    // 6. Imprime a parte fracionária dígito por dígito
+    if (precisao > 0) {
+        printf(".");
+        for (int i = 0; i < precisao; i++) {
+            parte_fracionaria *= 10.0;
+            int digito = (int)parte_fracionaria;
+            printf("%d", digito);
+            parte_fracionaria -= (float)digito;
+        }
+    }
+}
+
 void serial_print(const char *fmt, NkPrintQueueEntry entry)
 {
   float *auxfloat;
@@ -843,7 +879,33 @@ void serial_print(const char *fmt, NkPrintQueueEntry entry)
 
         //Sem suporte para soft float com esse toolchain.
         case 'f':
-          break;
+            auxfloat = (float *)&entry.var.f;
+            
+            // Percorre a string de formatação caractere por caractere
+            for (const char *p = fmt; *p != '\0'; p++) {
+                
+                if (*p == '%') {
+                    const char *temp = p + 1;
+                    
+                    // Ignora possíveis modificadores (ex: %.2f, %04f, %.*f)
+                    // para garantir que pegamos o 'f' corretamente
+                    while (*temp == '.' || *temp == '*' || (*temp >= '0' && *temp <= '9')) {
+                        temp++;
+                    }
+                    
+                    if (*temp == 'f') {
+                        // Chegou no 'f'! Imprime o float usando sua função
+                        print_float_custom(*auxfloat, calcularPrecisao(*auxfloat));
+                        
+                        p = temp; // Avança o ponteiro principal para pular o 'f'
+                        continue; // Vai para a próxima iteração do laço
+                    }
+                }
+                
+                // Se não for o '%f', imprime o caractere normal (texto antes e depois)
+                printf("%c", *p);
+            }
+            break;
 
         case 's':
             printf(fmt, entry.var.s);
@@ -925,32 +987,63 @@ float stringToFloat(const char* str) {
     return result * factor;
 }
 
-// void serialEvent() {
-//     while (Serial.available()) {
-//         char c = Serial.read();
-//         if (c == '\n') {
-//             serialInputBuffer[serialInputIndex] = '\0';  // Termina a string
-//             serialInputIndex = 0;  // Reinicia o ?ndice
+int stringToInt(const char* str) {
+    int result = 0;
+    int sign = 1;
 
-//             // Desbloquear a thread que esta esperando por entrada
-//             if (nkreadQueueHead != nkreadQueueTail) {
-//                 NkReadQueueEntry entry = dequeueNkRead();
-//                 if (strcmp(entry.format, "%f") == 0) {
-//                     // Para float, usar nossa fun??o auxiliar
-//                     *(float *)(entry.var) = stringToFloat(serialInputBuffer);
-//                 } else {
-//                     // Interpretar a entrada de acordo com o formato fornecido
-//                     sscanf(serialInputBuffer, entry.format, entry.var);
-//                 }
-//                 Descriptors[entry.tid].State = READY;
-//             }
-//         } else {
-//             if (serialInputIndex < 127) {
-//                 serialInputBuffer[serialInputIndex++] = c;
-//             }
-//         }
-//     }
-// }
+    // Ignora possíveis espaços em branco no início
+    while (*str == ' ' || *str == '\n' || *str == '\r') {
+        str++;
+    }
+
+    // Verifica sinal negativo
+    if (*str == '-') {
+        sign = -1;
+        str++;
+    }
+
+    // Converte os caracteres numéricos
+    for (; *str >= '0' && *str <= '9'; str++) {
+        result = result * 10 + (*str - '0');
+    }
+
+    return result * sign;
+}
+
+void serialEvent() {
+    while (UART_USB_AVAIL & 0X4) {
+        char c = UART_USB_EP1_DATA;
+        if (c == '\n') {
+            serialInputBuffer[serialInputIndex] = '\0';  // Termina a string
+            serialInputIndex = 0;  // Reinicia o ?ndice
+
+            // Desbloquear a thread que esta esperando por entrada
+            if (nkreadQueueHead != nkreadQueueTail) {
+                NkReadQueueEntry entry = dequeueNkRead();
+                 if (strcmp(entry.format, "%f") == 0) {
+                    // Para float, usar nossa fun??o auxiliar
+                   *(float *)(entry.var) = stringToFloat(serialInputBuffer);
+                } else if (strcmp(entry.format, "%c") == 0) {
+                    *(char *)entry.var = serialInputBuffer[0];
+                }
+                else if (strcmp(entry.format, "%s") == 0) {
+                    strcpy(entry.var, serialInputBuffer);
+                }
+                else if (strcmp(entry.format, "%d") == 0) {
+                    *(int *)entry.var = stringToInt(serialInputBuffer);
+                }
+                else if (strcmp(entry.format, "%u") == 0) {
+                    *(unsigned *)entry.var = stringToInt(serialInputBuffer);
+                }
+                Descriptors[entry.tid].State = READY;
+            }
+        } else {
+            if (serialInputIndex < 127) {
+                serialInputBuffer[serialInputIndex++] = c;
+            }
+        }
+    }
+}
 
 
 /*************************************************************
@@ -1103,20 +1196,37 @@ int i, j ;
 //sem_t s2;
 //sem_t s3;
 
-void p0() { 
-  static int number3;
-  int teste = 10;
-  char teste2 = 'A';
-  float teste3 = 3.14159;
-  char teste4[20] = "Hello, World!";
-  getmynumber(&number3);
+void p0() {
+  printf("'p3' (Read Test) started\n");
+  static int my_tid;
+  getmynumber(&my_tid);
+
+  int valor_inteiro = 0;
+  float valor_float = 0.0;
+  char buffer_texto[30] = "";
+
   while (1) {
-    nkprint("P3 running\n", 0);
-    nkprint("int: %d\n", &teste);
-    nkprint("char: %c\n", &teste2);
-    nkprint("percent: %%\n", 0);
-    nkprint("string: %s\n", &teste4);
-    sleep(2);
+    nkprint("\n--- Teste de Entrada (nkread) ---\n", 0);
+    
+    // 1. Lendo um Inteiro
+    nkprint("Digite um numero inteiro: ", 0);
+    nkread("%d", &valor_inteiro); // A task bloqueia aqui ate o \n chegar na serial
+    nkprint("Inteiro lido: %d\n", &valor_inteiro);
+
+    // 2. Lendo um Float
+    nkprint("Digite um numero float (ex: 3.14): ", 0);
+    nkread("%f", &valor_float);
+    nkprint("Float lido: %f\n", &valor_float);
+
+    // 3. Lendo uma String
+    nkprint("Digite uma palavra: ", 0);
+    nkread("%s", buffer_texto);
+    nkprint("String lida: %s\n", buffer_texto);
+
+    nkprint("---------------------------------\n", 0);
+    
+    // Pausa para não poluir a tela imediatamente caso caia em algum loop
+    sleep(2); 
   }
 }
 
@@ -1126,10 +1236,7 @@ void p1() {
   getmynumber(&number1);
   while (1) {
     //printReadyList();
-    nkprint("P1 running\n", 0);
-    for(volatile long d = 0; d < 1816000L; d++);
-    nkprint("P1 Finished\n", 0);
-    rmssleep();
+
   }
 }
 
@@ -1139,10 +1246,6 @@ void p2() {
   getmynumber(&number2);
   while (1) {
     //printReadyList();
-    nkprint("P2 running\n", 0);
-    for(volatile long d = 0; d < 2724000L; d++);
-    nkprint("P2 Finished\n", 0);
-    rmssleep();
   }
 }
 

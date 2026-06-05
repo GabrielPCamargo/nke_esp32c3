@@ -63,6 +63,14 @@
 #define GPIO_PIN(n)             (*(volatile uint32_t *)(C3_GPIO + 0x074 + (n)*4))
 
 // =============================================================================
+// UART-USB REGISTERS
+// =============================================================================
+#define UART_USB_BASE           0x60043000UL
+#define UART_USB_AVAIL           (*(volatile uint32_t *)(UART_USB_BASE + 0x004))
+#define UART_USB_EP1_DATA              (*(volatile uint32_t *)(UART_USB_BASE + 0x000))
+
+
+// =============================================================================
 // PIN / INTERRUPT ASSIGNMENTS
 // =============================================================================
 #define CPU_INTR_GPIO    5

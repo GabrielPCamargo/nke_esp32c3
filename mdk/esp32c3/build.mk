@@ -18,7 +18,7 @@ build: $(PROG).bin
 
 $(PROG).elf: $(SRCS)
 	$(TOOLCHAIN)-gcc  $(CFLAGS) $(SRCS) $(LINKFLAGS) -o $@
-#	$(TOOLCHAIN)-size $@
+	$(TOOLCHAIN)-size $@
 
 $(PROG).bin: $(PROG).elf $(ESPUTIL)
 	$(ESPUTIL) mkbin $(PROG).elf $@
