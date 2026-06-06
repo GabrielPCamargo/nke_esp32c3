@@ -1,4 +1,4 @@
-# NKE (fakeOS) versão ESP32C3
+# NKE (fakeOS) ESP32C3
 
 Esse repositório apresenta uma versão do NKE para o ESP32C3 (RISC-V) que baseia-se no framework para compilação baremetal [MDK](https://github.com/cpq/mdk) (sem nenhuma utilização do ESP-IDF) e na ferramenta de flash [Esputil](https://github.com/cpq/esputil) com pequenas alterações comentadas [aqui](#alterações).
 
@@ -127,23 +127,22 @@ O arquivo esputil.c foi atualizado permitindo a entrada no modo download em plac
 
 ```c
 static void reset_to_bootloader(int fd) {
-  sleep_ms(100);       // Wait
-  set_dtr(fd, false);  // IO0 -> HIGH
-  set_rts(fd, false);   // EN -> LOW
-  sleep_ms(100);       // Wait
-  set_dtr(fd, true);   // IO0 -> LOW
-  set_rts(fd, false);  // EN -> HIGH
-  sleep_ms(100);       // Wait
-  set_dtr(fd, true);  // IO0 -> HIGH
-  set_rts(fd, true);   // EN -> LOW
-  sleep_ms(100);       // Wait
-  set_dtr(fd, false);  // IO0 -> HIGH
-  set_rts(fd, true);   // EN -> LOW
-  sleep_ms(100);        // Wait
-  set_dtr(fd, false);  // IO0 -> HIGH
-  set_rts(fd, false);  // IO0 -> HIGH
-  flushio(fd);         // Discard all data
-}
+  sleep_ms(100);
+  set_dtr(fd, false);
+  set_rts(fd, false);
+  sleep_ms(100);
+  set_dtr(fd, true);
+  set_rts(fd, false);
+  sleep_ms(100);
+  set_dtr(fd, true);
+  set_rts(fd, true);
+  sleep_ms(100);
+  set_dtr(fd, false);
+  set_rts(fd, true);
+  sleep_ms(100);
+  set_dtr(fd, false);
+  set_rts(fd, false);
+  flushio(fd);
 
 ```
 A função de monitor também foi alterada para reinicar a ESP32C3 no começo da leitura da serial com a função hard_reset:
@@ -169,3 +168,32 @@ A função de monitor também foi alterada para reinicar a ESP32C3 no começo da
   }
 
 ```
+
+Monitor também foi alterado para enviar todos os dados de uma só vez na serial, ao invés de enviar um caractere após outro (Envio de dados após ENTER):
+```c
+  if (ready & 1) {  // Forward stdin to a device
+    uint8_t buf[BUFSIZ];
+    int n = read(0, buf, sizeof(buf));
+    if (n > 0 && ctx->verbose) dump("WRITE", buf, n);
+    for (i = 0; i < n; i++) uart_tx(buf[i], &ctx->fd);
+
+    if (n > 0 && ctx->verbose)
+      dump("WRITE", buf, n);
+
+    if (n > 0) {
+      int total = 0;
+
+      while (total < n) {
+        int rc = write(ctx->fd, buf + total, n - total);
+
+        if (rc <= 0)
+          fail("failed to write to fd %d", ctx->fd);
+
+        total += rc;
+      }
+    }
+  }
+```
+
+Por último, no arquivo mdk/esp32c3/link.ld foram adicionados endereços da libgcc armazenada na ROM da esp32c3.
+
