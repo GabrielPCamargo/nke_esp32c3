@@ -109,10 +109,7 @@ typedef struct {
   int16_t Tid;
   const char *name;
   unsigned short Prio;
-  uint8_t Period;
-  uint8_t Wcet;
-  uint8_t DynamicPeriod;
-  uint8_t DynamicWcet;
+  uint8_t prio;
   unsigned int Time;
   unsigned short Join;
   unsigned short State;
@@ -147,7 +144,6 @@ enum sys_temCall{
   SLEEP,
   MSLEEP,
   USLEEP,
-  RMSSLEEP,
   LIGALED,
   DESLIGALED,
   START, 
@@ -171,7 +167,7 @@ void kernel(Parameters *args) {
 
     switch(kernelargs.CallNumber){
     case TASKCREATE: 
-      sys_taskcreate((int *)kernelargs.p0,(void(*)())kernelargs.p1,(uint8_t)kernelargs.p2, (uint8_t)kernelargs.p3);
+      sys_taskcreate((int *)kernelargs.p0,(void(*)())kernelargs.p1,(uint8_t)kernelargs.p2);
       break;
     case SEM_WAIT: 
      // Serial.println("SEMWAIT: ") ;
@@ -203,9 +199,6 @@ void kernel(Parameters *args) {
       break;
     case USLEEP: 
       sys_usleep((int)kernelargs.p0);
-      break;
-    case RMSSLEEP: 
-      sys_rmssleep();
       break;
     case LIGALED: 
       sys_ligaled();
@@ -472,33 +465,11 @@ void wakeUP() //acorda a task bloqueada a espera de passagem de tempo
     if(Descriptors[i].Time>0)
     {
       Descriptors[i].Time--;
-      if(Descriptors[i].Time <= 0 && Descriptors[i].State == BLOCKED && Descriptors[i].State != READY)
+      if(Descriptors[i].Time <= 0 && Descriptors[i].State == BLOCKED)
       {
         Descriptors[i].State = READY;
         InsertReadyList(i) ; //tempo de espera se esgotou
       }
-    }
-
-    if(Descriptors[i].DynamicPeriod>0)
-    {
-      Descriptors[i].DynamicPeriod--;
-      if(Descriptors[i].DynamicPeriod <= 0) {
-        Descriptors[i].DynamicPeriod = Descriptors[i].Period;
-        Descriptors[i].DynamicWcet = Descriptors[i].Wcet;
-        if(i != TaskRunning && Descriptors[i].State != READY) { // ← só insere se não estiver rodando
-            Descriptors[i].State = READY;
-            InsertReadyList(i);
-        }
-      }
-    }
-  }
-
-  if(Descriptors[TaskRunning].DynamicWcet>0)
-  {
-    Descriptors[TaskRunning].DynamicWcet--;
-    if(Descriptors[TaskRunning].DynamicWcet <= 0)
-    {
-      Descriptors[TaskRunning].State = BLOCKED;
     }
   }
 }
@@ -584,7 +555,7 @@ void switchTaskUnsafe() {
 void sortReadyList() {
   for (int i = 0; i < ready_queue.head - 1; i++) {
       for (int j = 0; j < ready_queue.head - i - 1; j++) {
-          if (Descriptors[ready_queue.queue[j]].Period > Descriptors[ready_queue.queue[j + 1]].Period) {
+          if (Descriptors[ready_queue.queue[j]].Prio > Descriptors[ready_queue.queue[j + 1]].Prio) {
               int temp = ready_queue.queue[j];
               ready_queue.queue[j] = ready_queue.queue[j + 1];
               ready_queue.queue[j + 1] = temp;
@@ -612,19 +583,14 @@ void idle() {
 */
 
 //Isso aqui também foi alterdo é necessário revisar
-void sys_taskcreate(int *tid, void (*taskFunction)(void), uint8_t period, uint8_t wcet) {
+void sys_taskcreate(int *tid, void (*taskFunction)(void), uint8_t priority) {
     NumberTaskAdd++;
     *tid = NumberTaskAdd;
     Descriptors[NumberTaskAdd].Tid = *tid;
     Descriptors[NumberTaskAdd].State = READY;
     Descriptors[NumberTaskAdd].Join = 0;
     Descriptors[NumberTaskAdd].Time = 0;
-    Descriptors[NumberTaskAdd].Period = period;
-    Descriptors[NumberTaskAdd].Wcet = wcet;
-    Descriptors[NumberTaskAdd].DynamicPeriod = period;
-    Descriptors[NumberTaskAdd].DynamicWcet = wcet;
-
-    printf("Creating task with TID: %d, Function: %p, Period: %d, WCET: %d\n", *tid, taskFunction, period, wcet);
+    Descriptors[NumberTaskAdd].prio = priority;
 
     // Calcula o topo da pilha alinhado em 16 bytes
     uint8_t *stackTop = (uint8_t *)((uintptr_t)(Descriptors[*tid].Stack + SizeTaskStack) & ~0xF);
@@ -717,7 +683,7 @@ void sys_seminit(sem_t *semaforo, int ValorInicial)
 void sys_sleep(unsigned int segundo)
 {
   //Descriptors[TaskRunning].Time = segundo/ClkT;
-  Descriptors[TaskRunning].Time = (segundo*1000000)/Slice ;
+  Descriptors[TaskRunning].Time = segundo ;
   if(Descriptors[TaskRunning].Time > 0)
   {
     Descriptors[TaskRunning].State = BLOCKED;
@@ -740,15 +706,6 @@ void sys_usleep(unsigned int micro)
 {
   Descriptors[TaskRunning].Time = (micro/ClkT)/1000000;
   if(Descriptors[TaskRunning].Time > 0)
-  {
-    Descriptors[TaskRunning].State = BLOCKED;
-    switchTask();
-  }
-}
-
-void sys_rmssleep(void)
-{
-  if(Descriptors[TaskRunning].State == RUNNING)
   {
     Descriptors[TaskRunning].State = BLOCKED;
     switchTask();
@@ -987,7 +944,7 @@ float stringToFloat(const char* str) {
     return result * factor;
 }
 
-int stringToInt(const char* str) {
+int stringToInt(const char* str, int isUnsigned) {
     int result = 0;
     int sign = 1;
 
@@ -998,7 +955,9 @@ int stringToInt(const char* str) {
 
     // Verifica sinal negativo
     if (*str == '-') {
-        sign = -1;
+        if (!isUnsigned) {
+          sign = -1;
+        }
         str++;
     }
 
@@ -1030,12 +989,13 @@ void serialEvent() {
                     strcpy(entry.var, serialInputBuffer);
                 }
                 else if (strcmp(entry.format, "%d") == 0) {
-                    *(int *)entry.var = stringToInt(serialInputBuffer);
+                    *(int *)entry.var = stringToInt(serialInputBuffer, 0);
                 }
                 else if (strcmp(entry.format, "%u") == 0) {
-                    *(unsigned *)entry.var = stringToInt(serialInputBuffer);
+                    *(unsigned *)entry.var = stringToInt(serialInputBuffer, 1);
                 }
                 Descriptors[entry.tid].State = READY;
+                InsertReadyList(entry.tid) ;
             }
         } else {
             if (serialInputIndex < 127) {
@@ -1053,15 +1013,13 @@ void serialEvent() {
 *                                                            *
 *************************************************************/
 
-void taskcreate(int *ID,void (*funcao)(), uint8_t period, uint8_t wcet) //parametros armazenados em R0 e R1 na chamada
+void taskcreate(int *ID,void (*funcao)(), uint8_t Priority) //parametros armazenados em R0 e R1 na chamada
 {
   Parameters arg;
-  printf("taskcreate called with funcao=%p, period=%d, wcet=%d\n", funcao, period, wcet); // Debug
   arg.CallNumber=TASKCREATE;
   arg.p0=(unsigned char *)ID;
   arg.p1=(unsigned char *)funcao;
-  arg.p2=(unsigned char *)(uint16_t)period;
-  arg.p3=(unsigned char *)(uint16_t)wcet;
+  arg.p2=(unsigned char *)(uint16_t)Priority;
   callsvc(&arg);
 }
 void start(int scheduler)
@@ -1139,12 +1097,6 @@ void usleep(int time)
   arg.p0=(unsigned char *)time;
   callsvc(&arg);
 }
-void rmssleep(void)
-{
-  Parameters arg;
-  arg.CallNumber=RMSSLEEP;
-  callsvc(&arg);
-}
 void taskexit(void)
 {
   Parameters arg;
@@ -1206,6 +1158,7 @@ void p0() {
   char buffer_texto[30] = "";
 
   while (1) {
+    nkprint("Running p0 (TID: %d)\n", &my_tid);
     nkprint("\n--- Teste de Entrada (nkread) ---\n", 0);
     
     // 1. Lendo um Inteiro
@@ -1223,6 +1176,10 @@ void p0() {
     nkread("%s", buffer_texto);
     nkprint("String lida: %s\n", buffer_texto);
 
+    nkprint("Digite uma letra: ", 0);
+    nkread("%c", buffer_texto);
+    nkprint("Letra lida: %c\n", buffer_texto);
+
     nkprint("---------------------------------\n", 0);
     
     // Pausa para não poluir a tela imediatamente caso caia em algum loop
@@ -1231,21 +1188,42 @@ void p0() {
 }
 
 void p1() {
-  printf("'p1' started with TID: %d\n", 1);
-  static int number1;
+  static int number1 ;
   getmynumber(&number1);
   while (1) {
-    //printReadyList();
-
+    printReadyList();
+    //nkprint("P1 will sleep: ", 0);
+    sleep(10);
+    nkprint("P1 running: ", 0);
   }
 }
 
 void p2() {
-  printf("'p2' started with TID: %d\n", 2);
   static int number2;
   getmynumber(&number2);
   while (1) {
-    //printReadyList();
+    printReadyList();
+    //nkprint("P2 will sleep: ", 0);
+    sleep(20);
+    nkprint("P2 running: ", 0);
+  }
+}
+
+void p3() {
+  static int number3;
+  int teste = 10;
+  char teste2 = 'A';
+  float teste3 = 3.14159;
+  char teste4[20] = "Hello, World!";
+  getmynumber(&number3);
+  while (1) {
+    nkprint("P3 running\n", 0);
+    nkprint("int: %d\n", &teste);
+    nkprint("char: %c\n", &teste2);
+    nkprint("float: %f\n", &teste3);
+    nkprint("percent: %%\n", 0);
+    nkprint("string: %s\n", &teste4);
+    sleep(2);
   }
 }
 
@@ -1277,10 +1255,10 @@ int main(void) {
     //seminit(&s2, 0);
     //seminit(&s3, 0);
     
-    taskcreate(&tid0,idle,100, 50);
-    taskcreate(&tid1,p0,10, 2);
-    taskcreate(&tid2,p1,20, 5);
-    taskcreate(&tid3,p2,30, 8);
+    taskcreate(&tid0,idle,100);
+    taskcreate(&tid1,p0,10);
+    taskcreate(&tid2,p1,20);
+    taskcreate(&tid3,p2,30);
     // taskcreate(&tid3,p3,1);
 
     start (RR) ;
