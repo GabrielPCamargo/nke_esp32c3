@@ -24,6 +24,7 @@
 */
 #define ClkT 2 //equivale a 2 segundos
 
+#define CPU_INTR_TIMER   6 // Número da interrupção do timer na CPU(ajuste conforme necessário)
 // SYSTIMER clock ESP32C3 = 16 MHz → 1000 ms = 16_000_000 ticks
 #define Slice 16000000UL //1 segundo
 #define MaxNumberTask 4
@@ -503,18 +504,6 @@ void InsertReadyList(int id) {
     ready_queue.head++;
 }
 
-
-/*
-*   
-* Se a task atual n o   Idle (TaskRunning != 0), a task   removida da Ready List
-* Caso n o esteja bloqueada, ela   reinserida no final da Ready List
-* A remo  o   feita com o deslocamento para a esquerda 
-* Chama a fun  o sortReadyList()
-* Atualiza TaskRunning com a primeira task da Ready List (TaskRunning = ready_queue.queue[0])
-* Se a Ready List estiver vazia, TaskRunning ser  0 (Idle) 
-*
-*/
-
 void switchTask() {
     //saveContext(&Descriptors[TaskRunning]);
 
@@ -570,10 +559,7 @@ void sortReadyList() {
 *
 */
 void idle() {
-    gpio_write(LED_PIN, 0);
-    printf("'idle' started with TID: %d\n", 0);
      while (1) {
-        wdt_disable();  // ← adicione isso
      } ;
 }
 /*
@@ -630,12 +616,14 @@ void sys_getmynumber(int *number)
 
 void sys_ligaled()
 {
-  //PORTB = PORTB | 0x20;
+  gpio_output(BUILT_IN_LED);
+  gpio_write(BUILT_IN_LED, 0); // No ESP32C3, LOW acende o LED e HIGH apaga
 }
 
 void sys_desligaled()
 {
-  //PORTB = PORTB & 0xDF;
+  gpio_output(BUILT_IN_LED);
+  gpio_write(BUILT_IN_LED, 1);
 }
 
 void sys_setmyname(const char *name)
@@ -666,6 +654,7 @@ void sys_sempost(sem_t *semaforo)
      semaforo->count++;
      if(semaforo->count <= 0)
      {
+      // Não adiona vários bloqueados na fila, apenas o primeiro
        Descriptors[semaforo->sem_queue[semaforo->header]].State = READY;
        InsertReadyList(semaforo->sem_queue[semaforo->header]);
        semaforo->header++;
@@ -786,37 +775,33 @@ void sys_nkprint(const char *format, void *var) {
   //switchTask();
 }
 
-void print_float_custom(float valor, int precisao) {
+void print_float(float value, int precision) {
     // 1. Lida com números negativos
-    if (valor < 0.0) {
+    if (value < 0.0) {
         printf("-");
-        valor = -valor;
+        value = -value;
     }
 
-    // 2. Aplica arredondamento básico com base na precisão
-    float arredondamento = 0.5;
-    for (int i = 0; i < precisao; ++i) {
-        arredondamento /= 10.0;
+    // 2. Aplica arredondamento básico com base na precisão (se > 0.5 para a próxima casa decimal)
+    float rounding = 0.5;
+    for (int i = 0; i < precision; ++i) {
+        rounding /= 10.0;
     }
-    valor += arredondamento;
+    value += rounding;
 
-    // 3. Extrai a parte inteira
-    int parte_inteira = (int)valor;
+    int integer_part = (int)value;
     
-    // 4. Extrai a parte fracionária
-    float parte_fracionaria = valor - (float)parte_inteira;
+    float fractional_part = value - (float)integer_part;
 
-    // 5. Imprime a parte inteira
-    printf("%d", parte_inteira);
+    printf("%d", integer_part);
 
-    // 6. Imprime a parte fracionária dígito por dígito
-    if (precisao > 0) {
+    if (precision > 0) {
         printf(".");
-        for (int i = 0; i < precisao; i++) {
-            parte_fracionaria *= 10.0;
-            int digito = (int)parte_fracionaria;
-            printf("%d", digito);
-            parte_fracionaria -= (float)digito;
+        for (int i = 0; i < precision; i++) {
+            fractional_part *= 10.0;
+            int digit = (int)fractional_part;
+            printf("%d", digit);
+            fractional_part -= (float)digit;
         }
     }
 }
@@ -834,25 +819,22 @@ void serial_print(const char *fmt, NkPrintQueueEntry entry)
             printf(fmt, entry.var.c);
             break;
 
-        //Sem suporte para soft float com esse toolchain.
         case 'f':
             auxfloat = (float *)&entry.var.f;
             
-            // Percorre a string de formatação caractere por caractere
             for (const char *p = fmt; *p != '\0'; p++) {
                 
                 if (*p == '%') {
                     const char *temp = p + 1;
                     
                     // Ignora possíveis modificadores (ex: %.2f, %04f, %.*f)
-                    // para garantir que pegamos o 'f' corretamente
+                    // para garantir que foi selecionado o 'f' corretamente
                     while (*temp == '.' || *temp == '*' || (*temp >= '0' && *temp <= '9')) {
                         temp++;
                     }
                     
                     if (*temp == 'f') {
-                        // Chegou no 'f'! Imprime o float usando sua função
-                        print_float_custom(*auxfloat, calcularPrecisao(*auxfloat));
+                        print_float(*auxfloat, calcularPrecisao(*auxfloat));
                         
                         p = temp; // Avança o ponteiro principal para pular o 'f'
                         continue; // Vai para a próxima iteração do laço
@@ -970,8 +952,8 @@ int stringToInt(const char* str, int isUnsigned) {
 }
 
 void serialEvent() {
-    while (UART_USB_AVAIL & 0X4) {
-        char c = UART_USB_EP1_DATA;
+    while (serial_available_usb()) {
+        char c = serial_read_usb();
         if (c == '\n') {
             serialInputBuffer[serialInputIndex] = '\0';  // Termina a string
             serialInputIndex = 0;  // Reinicia o ?ndice
@@ -1160,25 +1142,36 @@ void p0() {
   while (1) {
     nkprint("Running p0 (TID: %d)\n", &my_tid);
     nkprint("\n--- Teste de Entrada (nkread) ---\n", 0);
+
+    //semwait(&s0);
     
     // 1. Lendo um Inteiro
     nkprint("Digite um numero inteiro: ", 0);
     nkread("%d", &valor_inteiro); // A task bloqueia aqui ate o \n chegar na serial
     nkprint("Inteiro lido: %d\n", &valor_inteiro);
 
+    ligaled();
+   // sempost(&s1);
+
     // 2. Lendo um Float
     nkprint("Digite um numero float (ex: 3.14): ", 0);
     nkread("%f", &valor_float);
     nkprint("Float lido: %f\n", &valor_float);
+
+    desligaled();
 
     // 3. Lendo uma String
     nkprint("Digite uma palavra: ", 0);
     nkread("%s", buffer_texto);
     nkprint("String lida: %s\n", buffer_texto);
 
+    ligaled();
+
     nkprint("Digite uma letra: ", 0);
     nkread("%c", buffer_texto);
     nkprint("Letra lida: %c\n", buffer_texto);
+
+    desligaled();
 
     nkprint("---------------------------------\n", 0);
     
@@ -1192,9 +1185,11 @@ void p1() {
   getmynumber(&number1);
   while (1) {
     printReadyList();
+    //sempost(&s0);
     //nkprint("P1 will sleep: ", 0);
+    //semwait(&s1);
     sleep(10);
-    nkprint("P1 running: ", 0);
+    nkprint("Sem running: ", 0);
   }
 }
 

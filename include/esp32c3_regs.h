@@ -6,34 +6,23 @@
 // =============================================================================
 #define SYSTIMER_BASE           0x60023000UL
 
-// Clock + enable control (all enables live here, not in TARGET_CONF)
 #define SYSTIMER_CONF           (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0000))
-//   bit 31 = CLK_EN
-//   bit 29 = TIMER_UNIT0_WORK_EN
-//   bit 23 = TARGET0_WORK_EN  (COMP0 enable — must be set here, not in TARGET0_CONF)
-
-// UNIT0 snapshot
 #define SYSTIMER_UNIT0_OP       (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0004))
-//   bit 30 = TIMER_UNIT0_UPDATE  (trigger snapshot, WT)
-//   bit 29 = TIMER_UNIT0_VALUE_VALID (poll until 1)
 
 // UNIT0 load (write new counter value)
 #define SYSTIMER_UNIT0_LOAD_HI  (*(volatile uint32_t *)(SYSTIMER_BASE + 0x000C))
 #define SYSTIMER_UNIT0_LOAD_LO  (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0010))
-#define SYSTIMER_UNIT0_LOAD     (*(volatile uint32_t *)(SYSTIMER_BASE + 0x005C)) // strobe WT
+#define SYSTIMER_UNIT0_LOAD     (*(volatile uint32_t *)(SYSTIMER_BASE + 0x005C))
 
 // UNIT0 snapshot read (read-only, populated after UPDATE)
-#define SYSTIMER_UNIT0_VALUE_HI (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0040)) // RO
-#define SYSTIMER_UNIT0_VALUE_LO (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0044)) // RO
+#define SYSTIMER_UNIT0_VALUE_HI (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0040))
+#define SYSTIMER_UNIT0_VALUE_LO (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0044))
 
 // COMP0 (TARGET0) — alarm config
 #define SYSTIMER_TARGET0_HI     (*(volatile uint32_t *)(SYSTIMER_BASE + 0x001C))
 #define SYSTIMER_TARGET0_LO     (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0020))
 #define SYSTIMER_TARGET0_CONF   (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0034))
-//   bit 31 = TIMER_UNIT_SEL  (0 = UNIT0, 1 = UNIT1)
-//   bit 30 = PERIOD_MODE     (0 = target/one-shot, 1 = period)
-//   bits 25:0 = PERIOD value
-#define SYSTIMER_COMP0_LOAD     (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0050)) // strobe WT
+#define SYSTIMER_COMP0_LOAD     (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0050))
 
 // Interrupt registers
 #define SYSTIMER_INT_ENA        (*(volatile uint32_t *)(SYSTIMER_BASE + 0x0064))
@@ -66,16 +55,16 @@
 // UART-USB REGISTERS
 // =============================================================================
 #define UART_USB_BASE           0x60043000UL
-#define UART_USB_AVAIL           (*(volatile uint32_t *)(UART_USB_BASE + 0x004))
-#define UART_USB_EP1_DATA              (*(volatile uint32_t *)(UART_USB_BASE + 0x000))
+#define UART_USB_AVAIL          (*(volatile uint32_t *)(UART_USB_BASE + 0x004))
+#define UART_USB_EP1_DATA       (*(volatile uint32_t *)(UART_USB_BASE + 0x000))
 
 
 // =============================================================================
 // PIN / INTERRUPT ASSIGNMENTS
 // =============================================================================
-#define CPU_INTR_GPIO    5
-#define CPU_INTR_TIMER   6
-#define BTN_PIN          4
-#define LED_PIN          8
+#define BUILT_IN_LED     8
 
+
+#define serial_available_usb() (UART_USB_AVAIL & 0x4)
+#define serial_read_usb() (UART_USB_EP1_DATA)
 #endif // ESP32C3_REGS_H
