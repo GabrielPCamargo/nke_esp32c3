@@ -38,6 +38,30 @@ volatile int TaskRunning = 0;
 char myName[MAX_NAME_LENGTH];
 int  SchedulerAlgorithm ;
 
+uint64_t get_systimer_baremetal() {
+  SYSTIMER_UNIT0_OP = (1U << 30);
+
+  while(!(SYSTIMER_UNIT0_OP & (1U << 29))) {}
+
+  uint32_t low_bits = SYSTIMER_UNIT0_VALUE_LO;
+  uint32_t high_bits = SYSTIMER_UNIT0_VALUE_HI & 0x000FFFFF;
+
+  uint64_t tempo_atual = ((uint64_t)high_bits << 32) | low_bits;
+
+  return tempo_atual;
+}
+
+unsigned long millis() {
+	uint64_t ticks = get_systimer_baremetal();
+	unsigned long milliseconds = ticks / 16000; // 16 MHz clock, então 1 tick = 1/16.000.000 seconds
+	return milliseconds;
+}
+
+unsigned long micros() {
+	uint64_t ticks = get_systimer_baremetal();
+	unsigned long microseconds = ticks / 16; // 16 MHz clock, então 1 tick = 1/16.000.000 seconds
+	return microseconds;
+}
 
 enum Scheduler{
   RR,
